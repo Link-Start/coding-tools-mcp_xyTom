@@ -1,6 +1,7 @@
 const STORAGE_KEY = "coding-tools-mcp-control:v1";
 
 const defaultConfig = {
+  runnerMode: "bundled",
   serverCommand: "uvx coding-tools-mcp",
   workspace: "",
   transport: "http",
@@ -52,6 +53,11 @@ const authModes = [
   ["bearer", "Bearer"],
   ["oauth", "OAuth"],
   ["noauth", "Remote noauth"]
+];
+
+const runnerModes = [
+  ["bundled", "Bundled", "Use the MCP executable packaged with this desktop app."],
+  ["external", "External", "Run a custom command such as uvx coding-tools-mcp."]
 ];
 
 let config = loadConfig();
@@ -134,7 +140,7 @@ function render() {
       </div>
       <div>
         <span class="label">Runner</span>
-        <strong>${isTauri ? "Tauri backend" : "Browser preview"}</strong>
+        <strong>${escapeHtml(isTauri ? (config.runnerMode === "external" ? "External command" : "Bundled sidecar") : "Browser preview")}</strong>
       </div>
     </section>
 
@@ -168,11 +174,14 @@ function renderCoreSettings() {
       <div class="group-head">
         <div>
           <h2>Server</h2>
-          <p>Launch target and transport.</p>
+          <p>Launch target, workspace, and transport.</p>
         </div>
       </div>
+      <div class="stack runner-stack">
+        ${optionSet("runnerMode", runnerModes, config.runnerMode)}
+      </div>
       <div class="grid two">
-        ${inputField("Server command", "serverCommand", config.serverCommand, "uvx coding-tools-mcp")}
+        ${inputField("External command", "serverCommand", config.serverCommand, "uvx coding-tools-mcp", config.runnerMode !== "external")}
         ${inputField("Workspace", "workspace", config.workspace, "/path/to/repo")}
       </div>
       <div class="grid three">
@@ -606,7 +615,7 @@ function validateConfig(input) {
   const blockers = [];
   const warnings = [];
   if (!input.workspace.trim()) blockers.push("Workspace is required.");
-  if (!input.serverCommand.trim()) blockers.push("Server command is required.");
+  if (input.runnerMode === "external" && !input.serverCommand.trim()) blockers.push("External command is required.");
   if (input.transport !== "stdio" && (!Number.isInteger(input.port) || input.port < 1 || input.port > 65535)) {
     blockers.push("HTTP port must be between 1 and 65535.");
   }
@@ -621,7 +630,7 @@ function validateConfig(input) {
     }
   }
   try {
-    parseCommandLine(input.serverCommand);
+    if (input.runnerMode === "external") parseCommandLine(input.serverCommand);
     parseCommandLine(input.extraArgs);
   } catch (error) {
     blockers.push(error.message);
@@ -634,13 +643,17 @@ function validateConfig(input) {
 }
 
 function buildPreview(input) {
+  const runnerMode = input.runnerMode === "external" ? "external" : "bundled";
   let parts = [];
-  try {
-    parts = parseCommandLine(input.serverCommand);
-  } catch {
-    parts = ["uvx", "coding-tools-mcp"];
+  if (runnerMode === "external") {
+    try {
+      parts = parseCommandLine(input.serverCommand);
+    } catch {
+      parts = ["uvx", "coding-tools-mcp"];
+    }
   }
-  const executable = parts.shift() || "uvx";
+  const executable = runnerMode === "external" ? (parts.shift() || "uvx") : "coding-tools-mcp";
+  const displayExecutable = runnerMode === "external" ? executable : "<bundled:coding-tools-mcp>";
   const args = [...parts];
   if (input.transport === "stdio") {
     args.push("--stdio");
@@ -692,11 +705,12 @@ function buildPreview(input) {
     const masked = /TOKEN|SECRET|PASSWORD/.test(key) ? "********" : value;
     return `${key}=${shellQuote(masked)}`;
   });
-  const display = [...envPrefix, shellQuote(executable), ...args.map(arg => {
+  const display = [...envPrefix, shellQuote(displayExecutable), ...args.map(arg => {
     if (arg === input.authToken && input.authToken.trim()) return "********";
     return shellQuote(arg);
   })].join(" ");
   return {
+    runnerMode,
     executable,
     args,
     env,

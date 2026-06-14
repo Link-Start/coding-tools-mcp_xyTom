@@ -4,12 +4,18 @@ on:
   workflow_dispatch:
   pull_request:
     paths:
+      - "coding_tools_mcp/**"
       - "coding-tools-mcp-tauri/**"
       - ".github/workflows/tauri-desktop.yml"
+      - "pyproject.toml"
+      - "uv.lock"
   push:
     paths:
+      - "coding_tools_mcp/**"
       - "coding-tools-mcp-tauri/**"
       - ".github/workflows/tauri-desktop.yml"
+      - "pyproject.toml"
+      - "uv.lock"
 
 permissions:
   contents: read
@@ -25,18 +31,22 @@ jobs:
           - label: linux-x64
             os: ubuntu-24.04
             rust_target: ""
+            sidecar_target: x86_64-unknown-linux-gnu
             build_args: --bundles deb,rpm,appimage
           - label: windows-x64
             os: windows-latest
             rust_target: ""
+            sidecar_target: x86_64-pc-windows-msvc
             build_args: --bundles nsis,msi
           - label: macos-aarch64
-            os: macos-latest
+            os: macos-14
             rust_target: aarch64-apple-darwin
+            sidecar_target: aarch64-apple-darwin
             build_args: --target aarch64-apple-darwin --bundles app,dmg
           - label: macos-x64
-            os: macos-latest
+            os: macos-13
             rust_target: x86_64-apple-darwin
+            sidecar_target: x86_64-apple-darwin
             build_args: --target x86_64-apple-darwin --bundles app,dmg
 
     env:
@@ -72,6 +82,11 @@ jobs:
           cache: npm
           cache-dependency-path: coding-tools-mcp-tauri/package-lock.json
 
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
       - name: Install Rust stable
         if: matrix.rust_target == ''
         uses: dtolnay/rust-toolchain@stable
@@ -96,11 +111,15 @@ jobs:
         working-directory: ${{ env.PROJECT_DIR }}
         run: npm run check
 
+      - name: Build bundled MCP sidecar
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: npm run build:sidecar -- --target ${{ matrix.sidecar_target }}
+
       - name: Build Tauri bundle
         working-directory: ${{ env.PROJECT_DIR }}
         env:
           APPLE_SIGNING_IDENTITY: ${{ runner.os == 'macOS' && '-' || '' }}
-        run: npm run build -- ${{ matrix.build_args }}
+        run: npm run build:tauri -- ${{ matrix.build_args }}
 
       - name: Upload desktop bundles
         uses: actions/upload-artifact@v4

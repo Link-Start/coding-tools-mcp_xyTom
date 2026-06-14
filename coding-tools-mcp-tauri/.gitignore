@@ -10,3 +10,5 @@ src-tauri/icons/android/
 src-tauri/icons/ios/
 src-tauri/gen/
 src-tauri/target/
+.sidecar-build/
+src-tauri/binaries/coding-tools-mcp-*

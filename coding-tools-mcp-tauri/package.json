@@ -5,10 +5,12 @@
   "type": "module",
   "scripts": {
     "build:web": "node scripts/build-web.mjs",
-    "check": "node --check src/main.js && node --check scripts/build-web.mjs",
+    "build:sidecar": "node scripts/build-sidecar.mjs",
+    "check": "node --check src/main.js && node --check scripts/build-web.mjs && node --check scripts/build-sidecar.mjs",
     "tauri": "tauri",
-    "dev": "tauri dev",
-    "build": "tauri build"
+    "dev": "npm run build:sidecar -- --skip-if-exists && tauri dev",
+    "build:tauri": "tauri build",
+    "build": "npm run build:sidecar && tauri build"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.0.0"

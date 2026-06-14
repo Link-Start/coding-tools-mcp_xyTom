@@ -3,11 +3,12 @@ use std::{
     collections::BTreeMap,
     io::{BufRead, BufReader, Read, Write},
     net::{TcpStream, ToSocketAddrs},
-    process::{Child, Command, Stdio},
+    process::{Child, Command as StdCommand, Stdio},
     sync::{Arc, Mutex},
     thread,
     time::Duration,
 };
+use tauri_plugin_shell::ShellExt;
 
 #[derive(Default, Clone)]
 struct SharedState {
@@ -26,6 +27,7 @@ struct EnvPair {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct McpConfig {
+    runner_mode: String,
     server_command: String,
     workspace: String,
     transport: String,
@@ -57,6 +59,7 @@ struct McpConfig {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct BuildResult {
+    runner_mode: String,
     executable: String,
     args: Vec<String>,
     env: BTreeMap<String, String>,
@@ -95,13 +98,21 @@ struct HttpResponse {
     head: String,
 }
 
+const SIDECAR_NAME: &str = "coding-tools-mcp";
+const RUNNER_BUNDLED: &str = "bundled";
+const RUNNER_EXTERNAL: &str = "external";
+
 #[tauri::command]
 fn build_command(config: McpConfig) -> Result<BuildResult, String> {
     build_launch(&config)
 }
 
 #[tauri::command]
-fn start_server(config: McpConfig, state: tauri::State<'_, SharedState>) -> Result<RuntimeStatus, String> {
+fn start_server(
+    app: tauri::AppHandle,
+    config: McpConfig,
+    state: tauri::State<'_, SharedState>,
+) -> Result<RuntimeStatus, String> {
     let launch = build_launch(&config)?;
     {
         let mut guard = state.child.lock().map_err(|_| "process lock poisoned")?;
@@ -117,12 +128,8 @@ fn start_server(config: McpConfig, state: tauri::State<'_, SharedState>) -> Resu
     }
 
     push_log(&state.logs, format!("$ {}", launch.display));
-    let mut command = Command::new(&launch.executable);
-    command
-        .args(&launch.args)
-        .envs(launch.env.iter())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    let mut command = create_process_command(&app, &launch)?;
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
 
     let mut child = command
         .spawn()
@@ -275,12 +282,21 @@ fn build_launch(config: &McpConfig) -> Result<BuildResult, String> {
         return Err("host is required for HTTP transport".to_string());
     }
 
-    let mut parts = parse_command_line(config.server_command.trim())?;
-    if parts.is_empty() {
-        return Err("server command is required".to_string());
-    }
-    let executable = parts.remove(0);
-    let mut args = parts;
+    let runner_mode = if config.runner_mode == RUNNER_EXTERNAL {
+        RUNNER_EXTERNAL
+    } else {
+        RUNNER_BUNDLED
+    };
+
+    let (executable, mut args) = if runner_mode == RUNNER_EXTERNAL {
+        let mut parts = parse_command_line(config.server_command.trim())?;
+        if parts.is_empty() {
+            return Err("server command is required".to_string());
+        }
+        (parts.remove(0), parts)
+    } else {
+        (SIDECAR_NAME.to_string(), Vec::new())
+    };
 
     if config.transport == "stdio" {
         args.push("--stdio".to_string());
@@ -349,14 +365,36 @@ fn build_launch(config: &McpConfig) -> Result<BuildResult, String> {
     } else {
         format!("http://{}:{}/mcp", config.host.trim(), config.port)
     };
-    let display = render_command(&executable, &args, &env);
+    let display_executable = if runner_mode == RUNNER_BUNDLED {
+        format!("<bundled:{SIDECAR_NAME}>")
+    } else {
+        executable.clone()
+    };
+    let display = render_command(&display_executable, &args, &env);
     Ok(BuildResult {
+        runner_mode: runner_mode.to_string(),
         executable,
         args,
         env,
         display,
         endpoint,
     })
+}
+
+fn create_process_command(app: &tauri::AppHandle, launch: &BuildResult) -> Result<StdCommand, String> {
+    if launch.runner_mode == RUNNER_BUNDLED {
+        let command = app
+            .shell()
+            .sidecar(SIDECAR_NAME)
+            .map_err(|err| format!("bundled MCP sidecar is not available: {err}"))?
+            .args(&launch.args)
+            .envs(launch.env.clone());
+        Ok(command.into())
+    } else {
+        let mut command = StdCommand::new(&launch.executable);
+        command.args(&launch.args).envs(launch.env.iter());
+        Ok(command)
+    }
 }
 
 fn push_arg_pair(args: &mut Vec<String>, name: &str, value: &str) {
@@ -535,6 +573,7 @@ fn trim_raw(raw: String) -> String {
 
 fn main() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_shell::init())
         .manage(SharedState::default())
         .invoke_handler(tauri::generate_handler![
             build_command,

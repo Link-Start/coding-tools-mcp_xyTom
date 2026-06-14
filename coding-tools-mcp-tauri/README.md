@@ -6,7 +6,8 @@ A small Tauri desktop control panel for launching and checking a `coding-tools-m
 
 Core settings are first-class UI controls:
 
-- Server command: default `uvx coding-tools-mcp`
+- Runner mode: bundled sidecar or external command
+- External command: default `uvx coding-tools-mcp`
 - Workspace path
 - Transport: Streamable HTTP or stdio
 - HTTP host and port
@@ -32,6 +33,14 @@ Advanced settings stay editable without making the main surface too busy:
 
 The app stores local preferences in the WebView's local storage. It does not require or invent a server config file.
 
+## Bundled MCP sidecar
+
+Packaged desktop builds include a `coding-tools-mcp` sidecar executable. The sidecar is frozen from the Python package with PyInstaller during the Tauri build, so end users do not need to install Python, uv, or `coding-tools-mcp` separately.
+
+Developers still need uv and the normal Tauri toolchain to create packages. The build script uses uv to install the project plus the `image` extra, adds PyInstaller to that build environment, and writes the platform-specific executable to `src-tauri/binaries/coding-tools-mcp-$TARGET_TRIPLE` for Tauri to bundle.
+
+Advanced users can switch the UI to External command mode and run their own command, for example `uvx coding-tools-mcp` or an absolute path to another server build.
+
 ## Health checks
 
 For HTTP transport the app checks:
@@ -52,6 +61,8 @@ npm install
 npm run dev
 ```
 
+`npm run dev` builds the local sidecar on first run and reuses it afterwards.
+
 Build static web assets only:
 
 ```bash
@@ -70,4 +81,10 @@ Build the desktop app:
 npm run build
 ```
 
-The desktop build requires a normal Tauri/Rust toolchain plus the native Linux desktop development libraries used by Tauri. In this remote MCP workspace, Rust/Cargo were installed locally for validation, but the full Linux package build currently stops because `pkg-config` cannot find `gdk-3.0.pc`. That must be provided by the host image or installed as a system package before the final Tauri bundle can complete.
+Build the sidecar only:
+
+```bash
+npm run build:sidecar
+```
+
+The desktop build requires uv, Rust, Node.js, and the native desktop development libraries required by Tauri for the target platform.
