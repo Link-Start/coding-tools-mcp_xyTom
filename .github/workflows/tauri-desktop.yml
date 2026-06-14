@@ -1,0 +1,113 @@
+name: Tauri Desktop Build
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "coding-tools-mcp-tauri/**"
+      - ".github/workflows/tauri-desktop.yml"
+  push:
+    paths:
+      - "coding-tools-mcp-tauri/**"
+      - ".github/workflows/tauri-desktop.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: linux-x64
+            os: ubuntu-24.04
+            rust_target: ""
+            build_args: --bundles deb,rpm,appimage
+          - label: windows-x64
+            os: windows-latest
+            rust_target: ""
+            build_args: --bundles nsis,msi
+          - label: macos-aarch64
+            os: macos-latest
+            rust_target: aarch64-apple-darwin
+            build_args: --target aarch64-apple-darwin --bundles app,dmg
+          - label: macos-x64
+            os: macos-latest
+            rust_target: x86_64-apple-darwin
+            build_args: --target x86_64-apple-darwin --bundles app,dmg
+
+    env:
+      CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+      PROJECT_DIR: coding-tools-mcp-tauri
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Linux Tauri dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            curl \
+            file \
+            libayatana-appindicator3-dev \
+            libgtk-3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            patchelf \
+            pkg-config \
+            wget
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: npm
+          cache-dependency-path: coding-tools-mcp-tauri/package-lock.json
+
+      - name: Install Rust stable
+        if: matrix.rust_target == ''
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Rust stable with target
+        if: matrix.rust_target != ''
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+
+      - name: Cache Rust artifacts
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: coding-tools-mcp-tauri/src-tauri -> target
+          cache-on-failure: true
+
+      - name: Install frontend dependencies
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: npm ci
+
+      - name: Check JavaScript
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: npm run check
+
+      - name: Build Tauri bundle
+        working-directory: ${{ env.PROJECT_DIR }}
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ runner.os == 'macOS' && '-' || '' }}
+        run: npm run build -- ${{ matrix.build_args }}
+
+      - name: Upload desktop bundles
+        uses: actions/upload-artifact@v4
+        with:
+          name: coding-tools-mcp-control-${{ matrix.label }}
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            coding-tools-mcp-tauri/src-tauri/target/release/bundle/**/*
+            coding-tools-mcp-tauri/src-tauri/target/*/release/bundle/**/*

@@ -1,0 +1,12 @@
+node_modules/
+dist/
+.cargo/
+.rustup/
+.tooling/
+src-tauri/icons/64x64.png
+src-tauri/icons/Square*.png
+src-tauri/icons/StoreLogo.png
+src-tauri/icons/android/
+src-tauri/icons/ios/
+src-tauri/gen/
+src-tauri/target/
