@@ -234,10 +234,9 @@ fn check_health(config: McpConfig) -> Result<HealthReport, String> {
     }
 
     let body = r#"{"jsonrpc":"2.0","id":1,"method":"ping","params":{}}"#;
-    let token = if !config.auth_token.trim().is_empty() {
-        Some(config.auth_token.trim())
-    } else {
-        None
+    let token = match config.auth_mode.as_str() {
+        "bearer" if !config.auth_token.trim().is_empty() => Some(config.auth_token.trim()),
+        _ => None,
     };
     let ping = http_request(&config.host, config.port, "POST", "/mcp", Some(body), token);
     match ping {
@@ -280,6 +279,9 @@ fn build_launch(config: &McpConfig) -> Result<BuildResult, String> {
     }
     if config.transport != "stdio" && config.host.trim().is_empty() {
         return Err("host is required for HTTP transport".to_string());
+    }
+    if config.transport != "stdio" && config.port == 0 {
+        return Err("port must be between 1 and 65535 for HTTP transport".to_string());
     }
 
     let runner_mode = if config.runner_mode == RUNNER_EXTERNAL {
@@ -461,7 +463,7 @@ fn parse_command_line(input: &str) -> Result<Vec<String>, String> {
 fn render_command(executable: &str, args: &[String], env: &BTreeMap<String, String>) -> String {
     let mut rendered = Vec::new();
     for (key, value) in env {
-        let value = if key.contains("TOKEN") || key.contains("SECRET") || key.contains("PASSWORD") {
+        let value = if is_sensitive_key(key) {
             "********"
         } else {
             value.as_str()
@@ -478,6 +480,11 @@ fn shell_quote(value: &str) -> String {
         return value.to_string();
     }
     format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn is_sensitive_key(key: &str) -> bool {
+    let upper = key.to_ascii_uppercase();
+    upper.contains("TOKEN") || upper.contains("SECRET") || upper.contains("PASSWORD")
 }
 
 fn push_log(logs: &Arc<Mutex<Vec<String>>>, line: String) {
@@ -565,10 +572,14 @@ fn http_request(
 fn trim_raw(raw: String) -> String {
     const LIMIT: usize = 2400;
     if raw.len() <= LIMIT {
-        raw
-    } else {
-        format!("{}...\n[truncated]", &raw[..LIMIT])
+        return raw;
     }
+
+    let mut end = LIMIT.min(raw.len());
+    while end > 0 && !raw.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...\n[truncated]", &raw[..end])
 }
 
 fn main() {

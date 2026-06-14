@@ -30,6 +30,13 @@ const defaultConfig = {
   extraEnv: [{ key: "", value: "", enabled: true }]
 };
 
+const secretConfigFields = new Set([
+  "authToken",
+  "oauthPassword",
+  "oauthClientSecret",
+  "oauthTokenSecret"
+]);
+
 const toolProfiles = [
   ["full", "Full", "All tools, including edit and command execution."],
   ["read-only", "Read only", "Inspection tools and git read tools."],
@@ -78,7 +85,7 @@ setInterval(refreshLogs, 2500);
 function loadConfig() {
   try {
     const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || "null");
-    return normalizeConfig(saved ? { ...defaultConfig, ...saved } : defaultConfig);
+    return normalizeConfig(saved ? { ...defaultConfig, ...stripPersistedSecrets(saved) } : defaultConfig);
   } catch {
     return normalizeConfig(defaultConfig);
   }
@@ -94,7 +101,18 @@ function normalizeConfig(input) {
 }
 
 function saveConfig() {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(config));
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(stripPersistedSecrets(config)));
+}
+
+function stripPersistedSecrets(input) {
+  const next = structuredClone(input || {});
+  for (const field of secretConfigFields) {
+    if (field in next) next[field] = defaultConfig[field] ?? "";
+  }
+  if (Array.isArray(next.extraEnv)) {
+    next.extraEnv = next.extraEnv.map(item => isSensitiveKey(item?.key) ? { ...item, value: "" } : item);
+  }
+  return next;
 }
 
 function render() {
@@ -702,7 +720,7 @@ function buildPreview(input) {
   }
 
   const envPrefix = Object.entries(env).map(([key, value]) => {
-    const masked = /TOKEN|SECRET|PASSWORD/.test(key) ? "********" : value;
+    const masked = isSensitiveKey(key) ? "********" : value;
     return `${key}=${shellQuote(masked)}`;
   });
   const display = [...envPrefix, shellQuote(displayExecutable), ...args.map(arg => {
@@ -763,6 +781,10 @@ function shellQuote(value) {
   const text = String(value);
   if (/^[A-Za-z0-9_\-./:=@]+$/.test(text)) return text;
   return `'${text.replaceAll("'", "'\\''")}'`;
+}
+
+function isSensitiveKey(key) {
+  return /TOKEN|SECRET|PASSWORD/i.test(String(key));
 }
 
 async function copyText(text) {

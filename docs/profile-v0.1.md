@@ -345,7 +345,7 @@ Input schema:
     "max_lines": {
       "type": "integer",
       "minimum": 1,
-      "description": "Alias for setting end_line relative to start_line."
+      "description": "Alias for setting end_line relative to start_line. If end_line is also set, it must match start_line + max_lines - 1."
     },
     "max_bytes": {
       "type": "integer",
