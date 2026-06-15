@@ -113,12 +113,15 @@ jobs:
 
       - name: Build bundled MCP sidecar
         working-directory: ${{ env.PROJECT_DIR }}
+        env:
+          PYINSTALLER_CODESIGN_IDENTITY: ${{ runner.os == 'macOS' && vars.MACOS_SIGNING_IDENTITY || '' }}
+          PYINSTALLER_ENTITLEMENTS_FILE: src-tauri/Sidecar.entitlements.plist
         run: npm run build:sidecar -- --target ${{ matrix.sidecar_target }}
 
       - name: Build Tauri bundle
         working-directory: ${{ env.PROJECT_DIR }}
         env:
-          APPLE_SIGNING_IDENTITY: ${{ runner.os == 'macOS' && '-' || '' }}
+          APPLE_SIGNING_IDENTITY: ${{ runner.os == 'macOS' && (vars.MACOS_SIGNING_IDENTITY || '-') || '' }}
         run: npm run build:tauri -- ${{ matrix.build_args }}
 
       - name: Upload desktop bundles

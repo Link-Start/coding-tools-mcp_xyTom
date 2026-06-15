@@ -41,6 +41,8 @@ Developers still need uv and the normal Tauri toolchain to create packages. The 
 
 Advanced users can switch the UI to External command mode and run their own command, for example `uvx coding-tools-mcp` or an absolute path to another server build.
 
+For macOS signed builds, the PyInstaller sidecar must be signed with the same Apple Developer identity as the Tauri app. The build script automatically uses a real `APPLE_SIGNING_IDENTITY` value when present, or you can pass `--codesign-identity` / `PYINSTALLER_CODESIGN_IDENTITY` explicitly. The sidecar also uses `src-tauri/Sidecar.entitlements.plist` so the frozen Python runtime can load its bundled dynamic libraries under hardened runtime.
+
 ## Health checks
 
 For HTTP transport the app checks:
