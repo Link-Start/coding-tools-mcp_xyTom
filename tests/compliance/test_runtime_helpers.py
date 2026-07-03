@@ -657,6 +657,7 @@ Maven home: /usr/share/maven
             self.assertIn("server_info", read_only_names)
             self.assertIn("set_default_cwd", read_only_names)
             self.assertIn("git_blame", read_only_names)
+            self.assertIn("read_output", read_only_names)
             self.assertNotIn("apply_patch", read_only_names)
             self.assertNotIn("exec_command", read_only_names)
             self.assertNotIn("write_stdin", read_only_names)
@@ -670,6 +671,29 @@ Maven home: /usr/share/maven
                 self.assertIs(annotations.get("readOnlyHint"), True)
                 self.assertIs(annotations.get("destructiveHint"), False)
                 self.assertIs(annotations.get("openWorldHint"), False)
+
+    def test_exec_command_compact_preview_and_read_output(self) -> None:
+        with TemporaryDirectory() as tmp:
+            runtime = Runtime(Path(tmp), permission_mode="trusted")
+            result = runtime.exec_command(
+                {
+                    "cmd": "printf 'alpha\nbeta\n'",
+                    "timeout_ms": 5000,
+                    "yield_time_ms": 30000,
+                    "verbosity": "preview",
+                    "preview_bytes": 64,
+                }
+            )
+            self.assertEqual(result.get("status"), "exited", result)
+            self.assertEqual(result.get("exit_code"), 0, result)
+            self.assertIn("summary", result)
+            self.assertIn("preview", result)
+            self.assertIn("output_ref", result)
+            self.assertNotIn("stdout", result)
+            page = runtime.read_output({"output_ref": result["output_ref"], "offset": 0, "limit": 128})
+            self.assertIn("alpha", page.get("content", ""))
+            self.assertIn("beta", page.get("content", ""))
+            self.assertIsNone(page.get("next_offset"))
 
     def test_default_cwd_and_git_convenience_tools(self) -> None:
         if server_module.shutil.which("git") is None:

@@ -148,6 +148,8 @@ DESTRUCTIVE_RE = re.compile(
 MAX_HTTP_REQUEST_BYTES = 1_048_576
 MAX_JSON_RPC_BATCH_ITEMS = 50
 SESSION_BUFFER_BYTES = 1_048_576
+EXEC_PREVIEW_BYTES = 4096
+MAX_RETAINED_OUTPUT_SESSIONS = 128
 SHELL_CONTROL_TOKENS = {"|", "||", "&", "&&", ";", "(", ")"}
 REDIRECTION_TOKENS = {">", ">>", "<", "<>", ">&", "<&", "&>", "&>>"}
 HEREDOC_TOKENS = {"<<", "<<<"}
@@ -602,6 +604,13 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
         title="Kill session",
         description="Terminate a server-managed running command session.",
         destructive=True,
+    ),
+    "read_output": ToolSpec(
+        title="Read output",
+        description="Read retained command output by output_ref with byte offset pagination.",
+        read_only=True,
+        idempotent=True,
+        in_read_only_profile=True,
     ),
     "git_status": ToolSpec(
         title="Git status",
@@ -1470,6 +1479,19 @@ class ExecSession:
                 break
             thread.join(timeout=remaining)
 
+    def retained_output_bytes(self) -> bytes:
+        with self.lock:
+            stdout = bytes(self.stdout)
+            stderr = bytes(self.stderr)
+        sections: list[bytes] = []
+        if stdout:
+            sections.extend([b"--- stdout ---\n", stdout])
+        if stderr:
+            if sections:
+                sections.append(b"\n")
+            sections.extend([b"--- stderr ---\n", stderr])
+        return b"".join(sections)
+
 
 class Runtime:
     def __init__(
@@ -1525,6 +1547,7 @@ class Runtime:
         self._pending_codes_lock = threading.Lock()
         self.default_cwd = self.workspace.root
         self.sessions: dict[str, ExecSession] = {}
+        self.output_sessions: dict[str, ExecSession] = {}
         self.sessions_lock = threading.Lock()
         self.http_session_id = secrets.token_urlsafe(24)
         self.patch_baselines: dict[str, str | None] = {}
@@ -2442,7 +2465,7 @@ class Runtime:
             payload["elapsed_ms"] = int((time.time() - start) * 1000)
             payload.update(extra)
             self._add_exec_diagnostics(payload)
-            return payload
+            return self._format_session_output(session, payload, args)
 
         while True:
             if process.poll() is not None:
@@ -2709,6 +2732,105 @@ class Runtime:
             warnings=warnings or [],
         )
 
+    def _remember_output_session(self, session: ExecSession) -> None:
+        with self.sessions_lock:
+            self.output_sessions[session.session_id] = session
+            while len(self.output_sessions) > MAX_RETAINED_OUTPUT_SESSIONS:
+                oldest = next(iter(self.output_sessions))
+                self.output_sessions.pop(oldest, None)
+
+    def _get_output_session(self, session_id: str) -> ExecSession:
+        with self.sessions_lock:
+            session = self.sessions.get(session_id) or self.output_sessions.get(session_id)
+        if session is None:
+            raise ToolFailure("SESSION_NOT_FOUND", "Output session not found.", category="runtime")
+        return session
+
+    def _format_session_output(self, session: ExecSession, payload: dict[str, Any], args: dict[str, Any]) -> dict[str, Any]:
+        verbosity = str(args.get("verbosity", "")).strip().lower()
+        if not verbosity:
+            return payload
+        if verbosity not in {"summary", "preview", "full"}:
+            raise ToolFailure(
+                "INVALID_ARGUMENT",
+                "verbosity must be one of: summary, preview, full.",
+                category="validation",
+            )
+        self._remember_output_session(session)
+        output_ref = f"session:{session.session_id}:full"
+        payload["summary"] = self._session_output_summary(session, payload)
+        payload["output_ref"] = output_ref
+        if verbosity == "full":
+            return payload
+        compact = {
+            key: value
+            for key, value in payload.items()
+            if key
+            not in {
+                "stdout",
+                "stderr",
+                "stdout_truncated",
+                "stderr_truncated",
+                "stdout_truncated_by",
+                "stderr_truncated_by",
+                "stdout_output_lines",
+                "stderr_output_lines",
+                "stdout_output_bytes",
+                "stderr_output_bytes",
+                "stdout_omitted_bytes",
+                "stderr_omitted_bytes",
+            }
+        }
+        if verbosity == "preview":
+            preview_limit = int(args.get("preview_bytes", EXEC_PREVIEW_BYTES))
+            preview, preview_truncated = truncate_bytes(session.retained_output_bytes(), preview_limit)
+            compact["preview"] = preview
+            compact["preview_truncated"] = preview_truncated
+            compact["truncated"] = bool(compact.get("truncated") or preview_truncated)
+        return compact
+
+    def _session_output_summary(self, session: ExecSession, payload: dict[str, Any]) -> str:
+        retained = session.retained_output_bytes().decode("utf-8", errors="replace")
+        lines = retained.splitlines()
+        tail = next((line.strip() for line in reversed(lines) if line.strip()), "")
+        if len(tail) > 120:
+            tail = tail[:117] + "..."
+        elapsed = float(payload.get("elapsed_ms") or 0) / 1000.0
+        exit_code = payload.get("exit_code")
+        status = f"exit {exit_code}" if exit_code is not None else str(payload.get("status", "running"))
+        parts = [status, f"{elapsed:.1f}s", f"{len(lines)} lines"]
+        if tail:
+            parts.append(f"tail: {tail!r}")
+        return " | ".join(parts)
+
+    def read_output(self, args: dict[str, Any]) -> dict[str, Any]:
+        output_ref = str(args.get("output_ref", ""))
+        match = re.fullmatch(r"session:([^:]+):full", output_ref)
+        if not match:
+            raise ToolFailure("INVALID_ARGUMENT", "output_ref must look like session:<id>:full.", category="validation")
+        session = self._get_output_session(match.group(1))
+        session.refresh_status()
+        data = session.retained_output_bytes()
+        offset = max(0, int(args.get("offset", 0)))
+        limit = max(1, min(int(args.get("limit", EXEC_PREVIEW_BYTES)), SESSION_BUFFER_BYTES))
+        chunk = data[offset : offset + limit]
+        next_offset = offset + len(chunk) if offset + len(chunk) < len(data) else None
+        return {
+            "output_ref": output_ref,
+            "offset": offset,
+            "limit": limit,
+            "content": chunk.decode("utf-8", errors="replace"),
+            "next_offset": next_offset,
+            "total_retained_bytes": len(data),
+            "stdout_dropped_bytes": session.stdout_dropped_bytes,
+            "stderr_dropped_bytes": session.stderr_dropped_bytes,
+            "truncated": next_offset is not None,
+            "ok": True,
+            "warnings": ["older output was dropped from the rolling session buffer"]
+            if session.stdout_dropped_bytes or session.stderr_dropped_bytes
+            else [],
+        }
+
     def write_stdin(self, args: dict[str, Any]) -> dict[str, Any]:
         session_id = str(args.get("session_id", ""))
         session = self._get_session(session_id)
@@ -2717,7 +2839,8 @@ class Runtime:
         if session.process.poll() is not None:
             if chars:
                 raise ToolFailure("SESSION_CLOSED", "Session is closed; stdin write blocked.", category="runtime")
-            return session.snapshot_since_cursor(int(args.get("max_output_bytes", 65536)))
+            payload = session.snapshot_since_cursor(int(args.get("max_output_bytes", 65536)))
+            return self._format_session_output(session, payload, args)
         if chars:
             if session.process.stdin is None or session.process.stdin.closed:
                 raise ToolFailure("SESSION_CLOSED", "Session stdin is closed.", category="runtime")
@@ -2739,7 +2862,8 @@ class Runtime:
                         first_output_at = time.time()
                     if time.time() - first_output_at >= 0.05:
                         break
-        return session.snapshot_since_cursor(int(args.get("max_output_bytes", 65536)))
+        payload = session.snapshot_since_cursor(int(args.get("max_output_bytes", 65536)))
+        return self._format_session_output(session, payload, args)
 
     def _wait_for_session_exit(self, session: ExecSession, wait_seconds: float) -> bool:
         wait_until = time.time() + max(0.0, wait_seconds)
@@ -2777,6 +2901,7 @@ class Runtime:
             status = "exited"
         payload = session.snapshot_since_cursor(int(args.get("max_output_bytes", 65536)))
         payload.update({"killed": killed, "status": status, "evicted": evict, "signal_sent": signal_sent})
+        payload = self._format_session_output(session, payload, args)
         if status == "terminating":
             warnings = list(payload.get("warnings", []))
             warnings.append("Process did not exit after TERM/SIGKILL; session retained for retry or watchdog cleanup.")
@@ -4613,6 +4738,8 @@ def input_schemas() -> dict[str, dict[str, Any]]:
                 "timeout_ms": {**integer, "minimum": 1, "maximum": 600000, "default": 30000},
                 "yield_time_ms": {**integer, "minimum": 0, "maximum": 30000, "default": 1000},
                 "max_output_bytes": {**integer, "minimum": 1, "maximum": 1048576, "default": 65536},
+                "verbosity": {**string, "enum": ["summary", "preview", "full"]},
+                "preview_bytes": {**integer, "minimum": 1, "maximum": 1048576, "default": 4096},
                 "stdin": {**string, "default": ""},
                 "tty": {**boolean, "default": False},
                 "env": {"type": "object", "additionalProperties": {"type": "string"}, "default": {}},
@@ -4625,6 +4752,8 @@ def input_schemas() -> dict[str, dict[str, Any]]:
                 "chars": {**string, "default": ""},
                 "yield_time_ms": {**integer, "minimum": 0, "maximum": 30000, "default": 1000},
                 "max_output_bytes": {**integer, "minimum": 1, "maximum": 1048576, "default": 65536},
+                "verbosity": {**string, "enum": ["summary", "preview", "full"]},
+                "preview_bytes": {**integer, "minimum": 1, "maximum": 1048576, "default": 4096},
             },
             ["session_id"],
         ),
@@ -4634,8 +4763,18 @@ def input_schemas() -> dict[str, dict[str, Any]]:
                 "signal": {**string, "enum": ["TERM", "KILL", "INT"], "default": "TERM"},
                 "wait_ms": {**integer, "minimum": 0, "maximum": 30000, "default": 5000},
                 "max_output_bytes": {**integer, "minimum": 1, "maximum": 1048576, "default": 65536},
+                "verbosity": {**string, "enum": ["summary", "preview", "full"]},
+                "preview_bytes": {**integer, "minimum": 1, "maximum": 1048576, "default": 4096},
             },
             ["session_id"],
+        ),
+        "read_output": object_schema(
+            {
+                "output_ref": {**string, "minLength": 1},
+                "offset": {**integer, "minimum": 0, "default": 0},
+                "limit": {**integer, "minimum": 1, "maximum": 1048576, "default": 4096},
+            },
+            ["output_ref"],
         ),
         "git_status": object_schema(
             {
@@ -5683,3 +5822,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     return run_stdio(args) if args.stdio else run_http(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

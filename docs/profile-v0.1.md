@@ -213,6 +213,7 @@ P0 tools:
 - `exec_command`
 - `write_stdin`
 - `kill_session`
+- `read_output`
 - `git_status`
 - `git_diff`
 - `git_log`
@@ -227,7 +228,7 @@ P1 tool:
 Tool profiles:
 
 - `full`: expose all tools with truthful annotations.
-- `read-only`: expose only `server_info`, `check_exec_environment`, `get_default_cwd`, `set_default_cwd`, file read/list/search tools, git inspection tools, and `view_image`.
+- `read-only`: expose only `server_info`, `check_exec_environment`, `get_default_cwd`, `set_default_cwd`, file read/list/search tools, git inspection tools, `read_output`, and `view_image`.
 - `compat-readonly-all`: expose all tools, but advertise `readOnlyHint: true`, `destructiveHint: false`, and `openWorldHint: false` for every tool. This profile is a compatibility escape hatch only; mutation-capable tools still mutate local state.
 
 Forbidden tools and equivalent aliases:
@@ -757,6 +758,8 @@ Input schema:
       "maximum": 1048576,
       "default": 65536
     },
+    "verbosity": { "type": "string", "enum": ["summary", "preview", "full"] },
+    "preview_bytes": { "type": "integer", "minimum": 1, "maximum": 1048576, "default": 4096 },
     "stdin": { "type": "string", "default": "" },
     "tty": { "type": "boolean", "default": false },
     "env": {
@@ -788,6 +791,10 @@ Output schema:
     "stderr": { "type": "string" },
     "stdout_truncated": { "type": "boolean" },
     "stderr_truncated": { "type": "boolean" },
+    "summary": { "type": "string" },
+    "output_ref": { "type": "string" },
+    "preview": { "type": "string" },
+    "preview_truncated": { "type": "boolean" },
     "elapsed_ms": { "type": "integer" },
     "diagnostics": {
       "type": "array",
@@ -814,6 +821,7 @@ Policy requirements:
 - `rm -rf /`, `git reset --hard`, broad `chmod`/`chown`, and similar destructive commands must not execute without explicit permission.
 - Linux Landlock confinement must be applied when available. Safe and trusted modes must add only the exact external runtime directory as the extra non-workspace writable root. If Landlock is unavailable, `exec_command` must continue to run under policy checks and include a warning that an external sandbox is required for untrusted commands.
 - `exec_command` may include `diagnostics` with machine-readable error attribution while preserving raw stdout, stderr, and exit code.
+- When `verbosity` is `summary` or `preview`, `exec_command` omits raw `stdout` and `stderr` from the immediate response, returns `summary` plus `output_ref`, and callers can use `read_output` to page retained output. `preview` additionally returns a bounded `preview` string.
 - Long-running commands return `ok: true`, `status: "running"`, and `session_id`.
 - Timed-out commands must clean up their process group.
 
@@ -842,7 +850,9 @@ Input schema:
     "session_id": { "type": "string", "minLength": 1 },
     "chars": { "type": "string", "default": "" },
     "yield_time_ms": { "type": "integer", "minimum": 0, "maximum": 30000, "default": 1000 },
-    "max_output_bytes": { "type": "integer", "minimum": 1024, "maximum": 1048576, "default": 65536 }
+    "max_output_bytes": { "type": "integer", "minimum": 1024, "maximum": 1048576, "default": 65536 },
+    "verbosity": { "type": "string", "enum": ["summary", "preview", "full"] },
+    "preview_bytes": { "type": "integer", "minimum": 1, "maximum": 1048576, "default": 4096 }
   },
   "required": ["session_id"],
   "additionalProperties": false
@@ -864,6 +874,10 @@ Output schema:
     "stderr": { "type": "string" },
     "stdout_truncated": { "type": "boolean" },
     "stderr_truncated": { "type": "boolean" },
+    "summary": { "type": "string" },
+    "output_ref": { "type": "string" },
+    "preview": { "type": "string" },
+    "preview_truncated": { "type": "boolean" },
     "warnings": { "type": "array", "items": { "type": "string" } },
     "error": { "$ref": "#/$defs/tool_error" }
   },
@@ -898,7 +912,9 @@ Input schema:
     "session_id": { "type": "string", "minLength": 1 },
     "signal": { "type": "string", "enum": ["TERM", "KILL", "INT"], "default": "TERM" },
     "wait_ms": { "type": "integer", "minimum": 0, "maximum": 30000, "default": 5000 },
-    "max_output_bytes": { "type": "integer", "minimum": 1024, "maximum": 1048576, "default": 65536 }
+    "max_output_bytes": { "type": "integer", "minimum": 1024, "maximum": 1048576, "default": 65536 },
+    "verbosity": { "type": "string", "enum": ["summary", "preview", "full"] },
+    "preview_bytes": { "type": "integer", "minimum": 1, "maximum": 1048576, "default": 4096 }
   },
   "required": ["session_id"],
   "additionalProperties": false
@@ -919,6 +935,10 @@ Output schema:
     "signal": { "type": "string" },
     "stdout": { "type": "string" },
     "stderr": { "type": "string" },
+    "summary": { "type": "string" },
+    "output_ref": { "type": "string" },
+    "preview": { "type": "string" },
+    "preview_truncated": { "type": "boolean" },
     "warnings": { "type": "array", "items": { "type": "string" } },
     "error": { "$ref": "#/$defs/tool_error" }
   },
@@ -931,6 +951,62 @@ The tool may terminate only sessions created by this MCP server.
 If `status` is `terminating`, the server attempted graceful termination and forceful cleanup but did not
 observe process exit before the wait deadlines. The session is retained so clients can retry cleanup or
 observe later watchdog completion. Sessions are evicted only after terminal process state is confirmed.
+
+### read_output
+
+Description: Read retained command output by `output_ref` with byte-offset pagination.
+
+Annotations:
+
+```json
+{
+  "title": "Read output",
+  "readOnlyHint": true,
+  "destructiveHint": false,
+  "idempotentHint": true,
+  "openWorldHint": false
+}
+```
+
+Input schema:
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "output_ref": { "type": "string", "minLength": 1 },
+    "offset": { "type": "integer", "minimum": 0, "default": 0 },
+    "limit": { "type": "integer", "minimum": 1, "maximum": 1048576, "default": 4096 }
+  },
+  "required": ["output_ref"],
+  "additionalProperties": false
+}
+```
+
+Output schema:
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "ok": { "type": "boolean" },
+    "output_ref": { "type": "string" },
+    "offset": { "type": "integer" },
+    "limit": { "type": "integer" },
+    "content": { "type": "string" },
+    "next_offset": { "type": ["integer", "null"] },
+    "total_retained_bytes": { "type": "integer" },
+    "stdout_dropped_bytes": { "type": "integer" },
+    "stderr_dropped_bytes": { "type": "integer" },
+    "truncated": { "type": "boolean" },
+    "warnings": { "type": "array", "items": { "type": "string" } },
+    "error": { "$ref": "#/$defs/tool_error" }
+  },
+  "required": ["ok"]
+}
+```
+
+`output_ref` values are returned by session tools when compact verbosity is requested. Retention is bounded by the server's rolling session buffer and recent-output cache.
 
 ### git_status
 
