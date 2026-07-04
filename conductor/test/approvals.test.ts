@@ -7,6 +7,7 @@ import {
   isTuiAttached,
   listPendingApprovals,
   markTuiAttached,
+  MemoryApprovalBroker,
   respondToApproval,
   waitForApproval,
 } from "../src/shared/approvals.js";
@@ -26,5 +27,17 @@ describe("approval coordination", () => {
     await respondToApproval(sessionId, request.id, true);
     await expect(waitForApproval(sessionId, request.id, 100)).resolves.toBe("approved");
     await expect(listPendingApprovals(sessionId)).resolves.toHaveLength(0);
+  });
+
+  it("resolves in-memory approval requests without polling", async () => {
+    process.env.CTC_HOME = await mkdtemp(join(tmpdir(), "ctc-home-"));
+    const broker = new MemoryApprovalBroker();
+    const approval = await broker.request("memory-session", "network", { permission: "network" }, 1000);
+
+    await expect(broker.pending("memory-session")).resolves.toHaveLength(1);
+    await broker.respond("memory-session", approval.request.id, true);
+
+    await expect(approval.decision).resolves.toBe("approved");
+    await expect(broker.pending("memory-session")).resolves.toHaveLength(0);
   });
 });

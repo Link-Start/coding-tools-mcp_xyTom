@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { describe, expect, it } from "vitest";
-import { WorkspaceManager, type ToolCaller } from "../src/workspace/manager.js";
+import { WorkspaceManager, closeWorkspaceSession, mergeWorkspaceSession, type ToolCaller } from "../src/workspace/manager.js";
 import { createGitRepo } from "./git-fixtures.js";
 
 describe("WorkspaceManager", () => {
@@ -49,6 +49,46 @@ describe("WorkspaceManager", () => {
 
     await expect(manager.open({})).rejects.toThrow(/set_default_cwd failed/);
     expect(manager.current()).toBeUndefined();
+  });
+
+  it("refuses to merge a worktree into a dirty source repository", async () => {
+    const repo = await createGitRepo("ctc-workspace-dirty-merge-");
+    process.env.CTC_HOME = await mkdtemp(join(tmpdir(), "ctc-home-"));
+    const manager = new WorkspaceManager({
+      backend: new FakeBackend(),
+      sessionId: "session-dirty-merge",
+      defaultWorkspacePath: repo,
+      defaultMode: "worktree",
+    });
+
+    const opened = await manager.open({});
+    await writeFile(join(opened.workspace.activePath, "new.txt"), "worktree change\n", "utf8");
+    await writeFile(join(repo, "source-dirty.txt"), "source dirty\n", "utf8");
+
+    await expect(mergeWorkspaceSession("session-dirty-merge")).rejects.toThrow(/target repository has uncommitted changes/);
+    await manager.close({ force: true });
+  });
+
+  it("closes a recorded worktree session by id", async () => {
+    const repo = await createGitRepo("ctc-workspace-close-by-id-");
+    process.env.CTC_HOME = await mkdtemp(join(tmpdir(), "ctc-home-"));
+    const manager = new WorkspaceManager({
+      backend: new FakeBackend(),
+      sessionId: "session-close-by-id",
+      defaultWorkspacePath: repo,
+      defaultMode: "worktree",
+    });
+
+    const opened = await manager.open({});
+    await writeFile(join(opened.workspace.activePath, "new.txt"), "dirty\n", "utf8");
+
+    const blocked = await closeWorkspaceSession("session-close-by-id");
+    expect(blocked.closed).toBe(false);
+    expect(blocked.dirty).toBe(true);
+
+    const closed = await closeWorkspaceSession("session-close-by-id", { force: true });
+    expect(closed.closed).toBe(true);
+    expect(existsSync(opened.workspace.activePath)).toBe(false);
   });
 });
 

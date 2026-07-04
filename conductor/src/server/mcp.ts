@@ -21,10 +21,11 @@ import {
 } from "../baton/protocol.js";
 import { BackendClient, BackendDisconnectedError } from "../proxy/client.js";
 import { ReviewManager, showChangesSchema } from "../review/checkpoints.js";
-import { createApprovalRequest, isTuiAttached, waitForApproval } from "../shared/approvals.js";
+import { FileApprovalBroker, type ApprovalBroker } from "../shared/approvals.js";
 import { JsonlEventLog } from "../shared/logging.js";
 import { summarizeArgs, summarizeResult } from "../shared/summarize.js";
 import type { RuntimeOptions, ToolPolicy } from "../shared/types.js";
+import { JsonlSessionEventSink, type SessionEventSink } from "../sessions/events.js";
 import { closeWorkspaceSchema, openWorkspaceSchema, WorkspaceManager } from "../workspace/manager.js";
 
 export async function startConductorServer(options: RuntimeOptions): Promise<void> {
@@ -38,27 +39,37 @@ export async function startConductorServer(options: RuntimeOptions): Promise<voi
   await server.connect(transport);
 }
 
+export interface ConductorRuntimeHooks {
+  owner?: "stdio" | "tui";
+  events?: SessionEventSink;
+  approvals?: ApprovalBroker;
+}
+
 export class ConductorRuntime {
   private readonly backend: BackendClient;
-  private readonly eventLog: JsonlEventLog;
+  private readonly events: SessionEventSink;
+  private readonly approvals: ApprovalBroker;
   private readonly toolPolicy: ToolPolicy;
   private readonly sessionId: string;
   private readonly workspacePath: string;
   private readonly defaultMode: RuntimeOptions["defaultMode"];
   private readonly backendType: RuntimeOptions["backend"]["type"];
+  private readonly owner: "stdio" | "tui";
   private readonly workspace: WorkspaceManager;
   private readonly review: ReviewManager;
   private readonly baton: BatonManager;
   private readonly chatGptAdapterEnabled: boolean;
 
-  constructor(options: RuntimeOptions) {
+  constructor(options: RuntimeOptions, hooks: ConductorRuntimeHooks = {}) {
     this.backend = new BackendClient(options.backend);
-    this.eventLog = new JsonlEventLog(options.logPath, options.conciseLogs);
+    this.events = hooks.events ?? new JsonlSessionEventSink(new JsonlEventLog(options.logPath, options.conciseLogs));
+    this.approvals = hooks.approvals ?? new FileApprovalBroker();
     this.toolPolicy = options.toolPolicy;
     this.sessionId = options.sessionId;
     this.workspacePath = options.workspacePath;
     this.defaultMode = options.defaultMode;
     this.backendType = options.backend.type;
+    this.owner = hooks.owner ?? "stdio";
     this.chatGptAdapterEnabled = isChatGptAdapterEnabled(options.adapters);
     this.workspace = new WorkspaceManager({
       backend: this.backend,
@@ -72,16 +83,29 @@ export class ConductorRuntime {
 
   async start(): Promise<void> {
     await this.backend.start();
-    await this.eventLog.append({
+    await this.events.append({
       ts: new Date().toISOString(),
       sessionId: this.sessionId,
       type: "session_started",
+      owner: this.owner,
       workspacePath: this.workspacePath,
       defaultMode: this.defaultMode,
       backendType: this.backendType,
       backendStatus: this.backend.status(),
-      logPath: this.eventLog.path,
+      logPath: this.events.path ?? "",
     });
+  }
+
+  async stop(): Promise<void> {
+    await this.backend.close();
+  }
+
+  backendStatus() {
+    return this.backend.status();
+  }
+
+  id(): string {
+    return this.sessionId;
   }
 
   createServer(): Server {
@@ -110,33 +134,35 @@ export class ConductorRuntime {
       ]),
     }));
 
-    server.setRequestHandler(CallToolRequestSchema, async (request): Promise<CallToolResult> => {
-      const name = request.params.name;
-      const args = request.params.arguments ?? {};
-      const started = performance.now();
-      if (!conductorToolNames.has(name) && !isToolAllowed(name, this.toolPolicy)) {
-        const result = errorResult(`Tool ${name} is disabled by this workspace profile.`);
-        await this.recordToolCall(name, args, started, result, "tool disabled by policy");
-        return result;
-      }
-
-      try {
-        const result = conductorToolNames.has(name)
-          ? await this.callConductorTool(name, args)
-          : name === "request_permissions"
-            ? await this.callPermissionRequest(args)
-          : await this.backend.callTool(name, args);
-        await this.recordToolCall(name, args, started, result);
-        return result;
-      } catch (error) {
-        const message = error instanceof BackendDisconnectedError ? error.message : errorMessage(error);
-        const result = errorResult(message);
-        await this.recordToolCall(name, args, started, result, message);
-        return result;
-      }
+    server.setRequestHandler(CallToolRequestSchema, (request): Promise<CallToolResult> => {
+      return this.callTool(request.params.name, request.params.arguments ?? {});
     });
 
     return server;
+  }
+
+  async callTool(name: string, args: Record<string, unknown>): Promise<CallToolResult> {
+    const started = performance.now();
+    if (!conductorToolNames.has(name) && !isToolAllowed(name, this.toolPolicy)) {
+      const result = errorResult(`Tool ${name} is disabled by this workspace profile.`);
+      await this.recordToolCall(name, args, started, result, "tool disabled by policy");
+      return result;
+    }
+
+    try {
+      const result = conductorToolNames.has(name)
+        ? await this.callConductorTool(name, args)
+        : name === "request_permissions"
+          ? await this.callPermissionRequest(args)
+        : await this.backend.callTool(name, args);
+      await this.recordToolCall(name, args, started, result);
+      return result;
+    } catch (error) {
+      const message = error instanceof BackendDisconnectedError ? error.message : errorMessage(error);
+      const result = errorResult(message);
+      await this.recordToolCall(name, args, started, result, message);
+      return result;
+    }
   }
 
   private decorateTools(tools: readonly Tool[]): Tool[] {
@@ -171,7 +197,7 @@ export class ConductorRuntime {
 
     if (name === "show_changes") {
       const result = await this.review.showChanges(showChangesSchema.parse(args));
-      await this.eventLog.append({
+      await this.events.append({
         ts: new Date().toISOString(),
         sessionId: this.sessionId,
         type: "review_checkpoint",
@@ -205,13 +231,13 @@ export class ConductorRuntime {
   }
 
   private async callPermissionRequest(args: Record<string, unknown>): Promise<CallToolResult> {
-    if (!(await isTuiAttached(this.sessionId))) return this.backend.callTool("request_permissions", args);
+    if (!(await this.approvals.isAvailable(this.sessionId))) return this.backend.callTool("request_permissions", args);
 
     const argsSummary = summarizeArgs(args);
-    const request = await createApprovalRequest(this.sessionId, argsSummary, args);
-    await this.recordPermissionRequest(request.id, "pending", argsSummary);
-    const decision = await waitForApproval(this.sessionId, request.id);
-    await this.recordPermissionRequest(request.id, decision, argsSummary);
+    const approval = await this.approvals.request(this.sessionId, argsSummary, args);
+    await this.recordPermissionRequest(approval.request.id, "pending", argsSummary);
+    const decision = await approval.decision;
+    await this.recordPermissionRequest(approval.request.id, decision, argsSummary);
 
     if (decision === "approved") return this.backend.callTool("request_permissions", args);
     const reason = decision === "timeout" ? "timed out waiting for TUI approval" : "denied by attached TUI";
@@ -223,7 +249,7 @@ export class ConductorRuntime {
     state: "pending" | "approved" | "denied" | "timeout",
     argsSummary: string,
   ): Promise<void> {
-    await this.eventLog.append({
+    await this.events.append({
       ts: new Date().toISOString(),
       sessionId: this.sessionId,
       type: "permission_request",
@@ -241,7 +267,7 @@ export class ConductorRuntime {
     error?: string,
   ): Promise<void> {
     const eventError = error ?? (result.isError ? summarizeResult(result, 240) : undefined);
-    await this.eventLog.append({
+    await this.events.append({
       ts: new Date().toISOString(),
       sessionId: this.sessionId,
       type: "tool_call",

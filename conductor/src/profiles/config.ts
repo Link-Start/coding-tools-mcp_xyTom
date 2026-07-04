@@ -5,6 +5,7 @@ import { homedir } from "node:os";
 import { dirname, resolve } from "node:path";
 import { z } from "zod";
 import type { BackendConfig, RuntimeOptions, ToolPolicy, WorkspaceProfile } from "../shared/types.js";
+import { resolveGitRoot } from "../workspace/git.js";
 
 type StdioBackendConfig = Extract<BackendConfig, { type: "stdio" }>;
 
@@ -17,8 +18,12 @@ const profileSchema = z.object({
   repoPath: z.string(),
   backend: backendSchema,
   defaultMode: z.enum(["direct", "worktree"]).optional(),
+  permissionMode: z.enum(["safe", "trusted"]).optional(),
+  httpPort: z.number().int().min(1).max(65535).optional(),
   toolPolicy: z.object({ allow: z.array(z.string()).optional(), deny: z.array(z.string()).optional() }).optional(),
-  tunnel: z.object({ provider: z.enum(["cloudflared", "none"]), hostname: z.string().optional() }).optional(),
+  tunnel: z
+    .object({ provider: z.enum(["cloudflared", "none"]), hostname: z.string().optional(), enabled: z.boolean().optional() })
+    .optional(),
   adapters: z.array(z.string()).optional(),
 });
 
@@ -35,7 +40,7 @@ export interface ResolveRuntimeInput {
 }
 
 export async function resolveRuntimeOptions(input: ResolveRuntimeInput): Promise<RuntimeOptions> {
-  const workspacePath = resolve(input.path ?? process.cwd());
+  const workspacePath = await resolveProfileTargetPath(input.path ?? process.cwd());
   const profile = await readProfileForPath(workspacePath);
   const backend = resolveBackend(workspacePath, profile, input);
   const toolPolicy = mergeToolPolicy(profile?.toolPolicy, { allow: input.allow, deny: input.deny });
@@ -57,15 +62,16 @@ export async function resolveRuntimeOptions(input: ResolveRuntimeInput): Promise
 }
 
 export async function readProfileForPath(repoPath: string): Promise<WorkspaceProfile | undefined> {
-  const file = profilePathForRepo(repoPath);
+  const file = profilePathForRepo(await resolveProfileTargetPath(repoPath));
   if (!existsSync(file)) return undefined;
   const parsed: unknown = JSON.parse(await readFile(file, "utf8"));
   return profileSchema.parse(parsed);
 }
 
 export async function writeProfileForPath(repoPath: string, profile: WorkspaceProfile): Promise<string> {
-  const normalized = profileSchema.parse({ ...profile, repoPath: resolve(repoPath) });
-  const file = profilePathForRepo(repoPath);
+  const targetPath = await resolveProfileTargetPath(repoPath);
+  const normalized = profileSchema.parse({ ...profile, repoPath: targetPath });
+  const file = profilePathForRepo(targetPath);
   await mkdir(dirname(file), { recursive: true });
   await writeFile(file, `${JSON.stringify(normalized, null, 2)}\n`, "utf8");
   return file;
@@ -81,6 +87,11 @@ export function profilePathForRepo(repoPath: string): string {
 
 export function ctcHome(): string {
   return process.env.CTC_HOME || `${homedir()}/.ctc`;
+}
+
+export async function resolveProfileTargetPath(path: string): Promise<string> {
+  const requestedPath = resolve(path);
+  return (await resolveGitRoot(requestedPath)) ?? requestedPath;
 }
 
 function resolveBackend(

@@ -5,10 +5,9 @@ import { stdin as input, stdout as output } from "node:process";
 import { createInterface, type Interface } from "node:readline/promises";
 import { setTimeout as delay } from "node:timers/promises";
 import { render, Box, Text } from "ink";
-import { execa } from "execa";
 import { createElement } from "react";
 import { BackendClient } from "../proxy/client.js";
-import { defaultBackendForPath, writeProfileForPath } from "../profiles/config.js";
+import { defaultBackendForPath, resolveProfileTargetPath, writeProfileForPath } from "../profiles/config.js";
 import type { BackendConfig, ToolPolicy, WorkspaceMode, WorkspaceProfile } from "../shared/types.js";
 
 export interface SetupOptions {
@@ -38,7 +37,7 @@ interface SetupAnswers {
 
 export async function runSetupCli(path: string | undefined, options: SetupOptions): Promise<void> {
   const requestedPath = resolve(path ?? process.cwd());
-  const repoPath = await resolveRepoRoot(requestedPath).catch(() => requestedPath);
+  const repoPath = await resolveProfileTargetPath(requestedPath);
   const answers = options.yes || !process.stdin.isTTY ? answersFromOptions(repoPath, options) : await promptForAnswers(repoPath, options);
   const profile = buildProfile(answers);
 
@@ -65,7 +64,7 @@ async function promptForAnswers(repoPath: string, options: SetupOptions): Promis
   const rl = createInterface({ input, output });
   try {
     const confirmedRepo = resolve(await ask(rl, "Repository path", repoPath));
-    const finalRepo = await resolveRepoRoot(confirmedRepo).catch(() => confirmedRepo);
+    const finalRepo = await resolveProfileTargetPath(confirmedRepo);
     const backendType = await choose(rl, "Backend", ["stdio", "http"], options.backend ?? "stdio");
     const backend = backendType === "http" ? await promptHttpBackend(rl, options) : await promptStdioBackend(rl, finalRepo, options);
     const defaultMode = await choose(rl, "Default workspace mode", ["worktree", "direct"], options.defaultMode ?? "worktree");
@@ -135,11 +134,6 @@ async function smokeBackend(backend: BackendConfig): Promise<void> {
   } finally {
     await client.close().catch(() => undefined);
   }
-}
-
-async function resolveRepoRoot(path: string): Promise<string> {
-  const { stdout } = await execa("git", ["-C", path, "rev-parse", "--show-toplevel"]);
-  return stdout.trim();
 }
 
 async function commandExists(command: string): Promise<boolean> {

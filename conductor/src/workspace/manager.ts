@@ -52,6 +52,11 @@ export interface WorkspaceMergeResult {
   message: string;
 }
 
+interface WorktreeRemovalTarget {
+  repoRoot?: string;
+  worktreePath: string;
+}
+
 export class WorkspaceManager {
   private readonly backend: ToolCaller;
   private readonly sessionId: string;
@@ -131,7 +136,7 @@ export class WorkspaceManager {
     }
 
     await this.setBackendCwd(workspace.sourcePath).catch(() => undefined);
-    await removeWorktree(workspace, true);
+    await removeWorktree({ repoRoot: workspace.repoRoot, worktreePath }, true);
     const closed = { ...workspace, closedAt: new Date().toISOString() };
     this.state = closed;
     await writeSessionState(closed);
@@ -160,7 +165,7 @@ export class WorkspaceManager {
     try {
       await this.setBackendCwd(worktreePath);
     } catch (error) {
-      await removeWorktree({ repoRoot, worktreePath } as WorkspaceState, true).catch(() => undefined);
+      await removeWorktree({ repoRoot, worktreePath }, true).catch(() => undefined);
       throw error;
     }
     return {
@@ -198,6 +203,33 @@ export async function readWorkspaceSession(sessionId: string): Promise<Workspace
   return readSessionState(sessionId).catch(() => undefined);
 }
 
+export async function closeWorkspaceSession(sessionId: string, input: CloseWorkspaceArgs = {}): Promise<CloseWorkspaceResult> {
+  const state = await readSessionState(sessionId).catch(() => undefined);
+  if (!state || state.closedAt) return { closed: false, message: "No workspace is open in this session." };
+
+  if (state.mode === "direct") {
+    const closed = { ...state, closedAt: new Date().toISOString() };
+    await writeSessionState(closed);
+    return { closed: true, workspace: closed, message: "Direct workspace closed." };
+  }
+
+  const worktreePath = requireWorktreePath(state);
+  const dirty = existsSync(worktreePath) ? await isGitDirty(worktreePath) : false;
+  if (dirty && !input.force) {
+    return {
+      closed: false,
+      workspace: state,
+      dirty: true,
+      message: "Worktree has uncommitted changes. Re-run with force after reviewing or merging.",
+    };
+  }
+
+  await removeWorktree({ repoRoot: state.repoRoot, worktreePath }, true);
+  const closed = { ...state, closedAt: new Date().toISOString() };
+  await writeSessionState(closed);
+  return { closed: true, workspace: closed, dirty, message: "Worktree workspace closed and removed." };
+}
+
 export async function cleanWorkspaceSessions(options: { force?: boolean } = {}): Promise<WorkspaceCleanResult> {
   const result: WorkspaceCleanResult = { removed: [], skippedDirty: [], missing: [] };
   for (const state of await listWorkspaceSessions()) {
@@ -212,7 +244,7 @@ export async function cleanWorkspaceSessions(options: { force?: boolean } = {}):
       result.skippedDirty.push(state.sessionId);
       continue;
     }
-    await removeWorktree(state, true);
+    await removeWorktree({ repoRoot: state.repoRoot, worktreePath }, true);
     await writeSessionState({ ...state, closedAt: new Date().toISOString() });
     result.removed.push(state.sessionId);
   }
@@ -225,6 +257,9 @@ export async function mergeWorkspaceSession(sessionId: string): Promise<Workspac
   if (state.mode !== "worktree") throw new Error(`Session ${sessionId} is not a worktree workspace.`);
   const worktreePath = requireWorktreePath(state);
   const repoRoot = state.repoRoot ?? (await gitOutput(state.sourcePath, ["rev-parse", "--show-toplevel"]));
+  if (await isGitDirty(repoRoot)) {
+    throw new Error(`Cannot merge session ${sessionId}; target repository has uncommitted changes at ${repoRoot}.`);
+  }
   const baseCommit = state.baseCommit ?? (await gitOutput(worktreePath, ["rev-parse", "HEAD"]));
   const snapshot = await createSnapshotCommit(worktreePath, baseCommit, "ctc merge snapshot");
   const patch = await gitOutput(worktreePath, ["diff", "--binary", baseCommit, snapshot], { trim: false });
@@ -258,8 +293,8 @@ function sessionsDir(): string {
   return join(ctcHome(), "sessions");
 }
 
-async function removeWorktree(state: WorkspaceState, force: boolean): Promise<void> {
-  const worktreePath = requireWorktreePath(state);
+async function removeWorktree(state: WorktreeRemovalTarget, force: boolean): Promise<void> {
+  const { worktreePath } = state;
   if (state.repoRoot && existsSync(state.repoRoot)) {
     const args = ["-C", state.repoRoot, "worktree", "remove"];
     if (force) args.push("--force");

@@ -10,7 +10,7 @@ import { createGitRepo } from "./git-fixtures.js";
 
 describe("profile setup and doctor", () => {
   it("writes and reads workspace profiles", async () => {
-    const repo = await mkdtemp(join(tmpdir(), "ctc-profile-"));
+    const repo = await createGitRepo("ctc-profile-");
     process.env.CTC_HOME = await mkdtemp(join(tmpdir(), "ctc-home-"));
     const profile: WorkspaceProfile = {
       repoPath: repo,

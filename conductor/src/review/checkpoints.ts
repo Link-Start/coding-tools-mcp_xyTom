@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 
@@ -30,6 +31,18 @@ export interface ShowChangesResult {
 }
 
 const maxDiffChars = 20_000;
+const gitIdentityEnv = {
+  GIT_AUTHOR_NAME: "ctc",
+  GIT_AUTHOR_EMAIL: "ctc@example.invalid",
+  GIT_COMMITTER_NAME: "ctc",
+  GIT_COMMITTER_EMAIL: "ctc@example.invalid",
+};
+
+interface CommandOptions {
+  env?: Record<string, string>;
+  trim?: boolean;
+  allowFailure?: boolean;
+}
 
 export class ReviewManager {
   private readonly backend: ReviewToolCaller;
@@ -56,18 +69,14 @@ export class ReviewManager {
     const snapshot = await this.createSnapshot(this.activePath, "show-changes");
     const base = this.baseForSince(since);
     const pathArgs = diffPathArgs(args.paths);
-    const stat = await this.git(
-      `git diff --stat --find-renames ${shellQuote(base)} ${shellQuote(snapshot)}${pathArgs}`,
-      this.activePath,
-    );
+    const stat = await this.git(["diff", "--stat", "--find-renames", base, snapshot, ...pathArgs], this.activePath);
 
     let diff: string | undefined;
     let truncated = false;
     if (!args.stat_only) {
-      const fullDiff = await this.git(
-        `git diff --find-renames ${shellQuote(base)} ${shellQuote(snapshot)}${pathArgs}`,
-        this.activePath,
-      );
+      const fullDiff = await this.git(["diff", "--find-renames", base, snapshot, ...pathArgs], this.activePath, {
+        trim: false,
+      });
       ({ text: diff, truncated } = truncateDiff(fullDiff));
     }
 
@@ -85,33 +94,31 @@ export class ReviewManager {
 
   async clearRefs(): Promise<void> {
     if (!this.activePath) return;
-    await this.git(`git update-ref -d ${shellQuote(this.baselineRef())} || true`, this.activePath);
-    await this.git(`git update-ref -d ${shellQuote(this.lastShownRef())} || true`, this.activePath);
+    await this.git(["update-ref", "-d", this.baselineRef()], this.activePath, { allowFailure: true });
+    await this.git(["update-ref", "-d", this.lastShownRef()], this.activePath, { allowFailure: true });
   }
 
   private async createSnapshot(activePath: string, label: string): Promise<string> {
-    const script = [
-      "set -e",
-      "tmp=$(mktemp \"${TMPDIR:-/tmp}/ctc-index.XXXXXX\")",
-      "trap 'rm -f \"$tmp\"' EXIT",
-      "export GIT_AUTHOR_NAME=ctc",
-      "export GIT_AUTHOR_EMAIL=ctc@example.invalid",
-      "export GIT_COMMITTER_NAME=ctc",
-      "export GIT_COMMITTER_EMAIL=ctc@example.invalid",
-      "GIT_INDEX_FILE=\"$tmp\" git read-tree HEAD",
-      "GIT_INDEX_FILE=\"$tmp\" git add -A",
-      "tree=$(GIT_INDEX_FILE=\"$tmp\" git write-tree)",
-      `commit=$(GIT_INDEX_FILE="$tmp" git commit-tree "$tree" -p HEAD -m ${shellQuote(`ctc review ${label}`)})`,
-      "printf '%s\\n' \"$commit\"",
-    ].join("\n");
-    const output = await this.git(script, activePath);
-    const snapshot = output.trim().split(/\s+/).at(-1);
-    if (!snapshot) throw new Error("Failed to create review snapshot.");
-    return snapshot;
+    const indexFile = await this.git(["rev-parse", "--git-path", `ctc-index-${randomUUID()}`], activePath);
+    const indexEnv = { GIT_INDEX_FILE: indexFile };
+    try {
+      await this.git(["read-tree", "HEAD"], activePath, { env: indexEnv });
+      await this.git(["add", "-A"], activePath, { env: indexEnv });
+      const tree = requireCommitHash(await this.git(["write-tree"], activePath, { env: indexEnv }), "snapshot tree");
+      const snapshot = requireCommitHash(
+        await this.git(["commit-tree", tree, "-p", "HEAD", "-m", `ctc review ${label}`], activePath, {
+          env: { ...indexEnv, ...gitIdentityEnv },
+        }),
+        "review snapshot",
+      );
+      return snapshot;
+    } finally {
+      await this.command(["rm", "-f", indexFile], activePath, { allowFailure: true });
+    }
   }
 
   private async updateRef(activePath: string, ref: string, commit: string): Promise<void> {
-    await this.git(`git update-ref ${shellQuote(ref)} ${shellQuote(commit)}`, activePath);
+    await this.git(["update-ref", ref, commit], activePath);
   }
 
   private baseForSince(since: "last_shown" | "workspace_open" | "head"): string {
@@ -128,17 +135,31 @@ export class ReviewManager {
     return `refs/ctc/review/${this.sessionId}/last-shown`;
   }
 
-  private async git(cmd: string, workdir: string): Promise<string> {
-    const result = await this.backend.callTool("exec_command", { cmd, workdir, verbosity: "full" });
-    if (result.isError) throw new Error(resultText(result) || `Command failed: ${cmd}`);
-    assertSuccessfulCommand(result, cmd);
-    return resultOutput(result);
+  private git(args: string[], workdir: string, options: CommandOptions = {}): Promise<string> {
+    return this.command(["git", ...args], workdir, options);
+  }
+
+  private async command(argv: string[], workdir: string, options: CommandOptions = {}): Promise<string> {
+    const cmd = argv.map(shellQuote).join(" ");
+    const result = await this.backend.callTool("exec_command", {
+      cmd,
+      workdir,
+      env: options.env,
+      verbosity: "full",
+    });
+    if (result.isError) {
+      if (options.allowFailure) return "";
+      throw new Error(resultText(result) || `Command failed: ${cmd}`);
+    }
+    if (!options.allowFailure) assertSuccessfulCommand(result, cmd);
+    const output = resultOutput(result);
+    return options.trim === false ? output : output.trim();
   }
 }
 
-function diffPathArgs(paths: string[] | undefined): string {
-  if (!paths?.length) return "";
-  return ` -- ${paths.map(shellQuote).join(" ")}`;
+function diffPathArgs(paths: string[] | undefined): string[] {
+  if (!paths?.length) return [];
+  return ["--", ...paths];
 }
 
 function truncateDiff(diff: string): { text: string; truncated: boolean } {
@@ -169,6 +190,12 @@ function resultText(result: CallToolResult): string {
     .map((item) => (item.type === "text" ? item.text : ""))
     .filter(Boolean)
     .join("\n");
+}
+
+function requireCommitHash(value: string, label: string): string {
+  const trimmed = value.trim();
+  if (!/^[0-9a-f]{40}$/i.test(trimmed)) throw new Error(`Unexpected ${label} hash: ${trimmed || "<empty>"}`);
+  return trimmed;
 }
 
 function shellQuote(value: string): string {

@@ -67,6 +67,7 @@ export class BackendClient {
   }
 
   async close(): Promise<void> {
+    this.reconnecting = false;
     const connection = this.connection;
     this.connection = undefined;
     if (connection) await connection.close();
@@ -105,8 +106,9 @@ export class BackendClient {
 
   private async reconnectLoop(): Promise<void> {
     let waitMs = 250;
-    while (this.reconnecting) {
+    for (;;) {
       await delay(waitMs);
+      if (!this.reconnecting) return;
       try {
         await this.connectOnce();
         await this.refreshToolCache();

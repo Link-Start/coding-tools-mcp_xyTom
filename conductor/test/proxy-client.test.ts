@@ -32,6 +32,25 @@ describe("BackendClient", () => {
     expect(recovered.content[0]?.type).toBe("text");
     await client.close();
   });
+
+  it("does not reconnect after close is called during a reconnect delay", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "ctc-backend-"));
+    const marker = join(dir, "failed-once");
+    const client = new BackendClient({
+      type: "stdio",
+      command: [process.execPath, "test/fixtures/line-backend.mjs", marker],
+    });
+
+    await client.start();
+    await expect(client.callTool("unstable", {})).rejects.toThrow(/reconnecting in background/);
+    expect(client.status().reconnecting).toBe(true);
+
+    await client.close();
+    await new Promise((resolve) => setTimeout(resolve, 400));
+
+    expect(client.status().reconnecting).toBe(false);
+    expect(client.status().connected).toBe(false);
+  });
 });
 
 async function eventually<T>(operation: () => Promise<T>, timeoutMs = 3000): Promise<T> {

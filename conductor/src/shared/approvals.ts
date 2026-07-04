@@ -18,6 +18,23 @@ export interface PermissionApprovalRequest {
   args: Record<string, unknown>;
 }
 
+export interface ApprovalHandle {
+  request: PermissionApprovalRequest;
+  decision: Promise<ApprovalStatus>;
+}
+
+export interface ApprovalBroker {
+  isAvailable(sessionId: string): Promise<boolean>;
+  request(
+    sessionId: string,
+    argsSummary: string,
+    args: Record<string, unknown>,
+    timeoutMs?: number,
+  ): Promise<ApprovalHandle>;
+  respond(sessionId: string, requestId: string, approved: boolean): Promise<void>;
+  pending(sessionId?: string): Promise<PermissionApprovalRequest[]>;
+}
+
 const attachFreshMs = 5_000;
 const pollMs = 500;
 
@@ -30,6 +47,87 @@ const approvalSchema = z.object({
   argsSummary: z.string(),
   args: z.record(z.unknown()),
 });
+
+interface PendingMemoryApproval {
+  request: PermissionApprovalRequest;
+  resolve(status: ApprovalStatus): void;
+  timeout: NodeJS.Timeout;
+}
+
+export class FileApprovalBroker implements ApprovalBroker {
+  async isAvailable(sessionId: string): Promise<boolean> {
+    return isTuiAttached(sessionId);
+  }
+
+  async request(
+    sessionId: string,
+    argsSummary: string,
+    args: Record<string, unknown>,
+    timeoutMs?: number,
+  ): Promise<ApprovalHandle> {
+    const request = await createApprovalRequest(sessionId, argsSummary, args);
+    return { request, decision: waitForApproval(sessionId, request.id, timeoutMs) };
+  }
+
+  async respond(sessionId: string, requestId: string, approved: boolean): Promise<void> {
+    await respondToApproval(sessionId, requestId, approved);
+  }
+
+  async pending(sessionId?: string): Promise<PermissionApprovalRequest[]> {
+    return sessionId ? listPendingApprovals(sessionId) : [];
+  }
+}
+
+export class MemoryApprovalBroker implements ApprovalBroker {
+  private readonly pendingRequests = new Map<string, PendingMemoryApproval>();
+
+  async isAvailable(): Promise<boolean> {
+    return true;
+  }
+
+  async request(
+    sessionId: string,
+    argsSummary: string,
+    args: Record<string, unknown>,
+    timeoutMs = 10 * 60 * 1000,
+  ): Promise<ApprovalHandle> {
+    const request = await createApprovalRequest(sessionId, argsSummary, args);
+    let resolveDecision: (status: ApprovalStatus) => void = () => undefined;
+    const decision = new Promise<ApprovalStatus>((resolve) => {
+      resolveDecision = resolve;
+    });
+    const timeout = setTimeout(() => {
+      void this.finish(sessionId, request.id, "timeout");
+    }, timeoutMs);
+    this.pendingRequests.set(memoryKey(sessionId, request.id), { request, resolve: resolveDecision, timeout });
+    return { request, decision };
+  }
+
+  async respond(sessionId: string, requestId: string, approved: boolean): Promise<void> {
+    await this.finish(sessionId, requestId, approved ? "approved" : "denied");
+  }
+
+  async pending(sessionId?: string): Promise<PermissionApprovalRequest[]> {
+    return [...this.pendingRequests.values()]
+      .map((entry) => entry.request)
+      .filter((request) => request.status === "pending" && (!sessionId || request.sessionId === sessionId))
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+  }
+
+  private async finish(sessionId: string, requestId: string, status: ApprovalStatus): Promise<void> {
+    const key = memoryKey(sessionId, requestId);
+    const entry = this.pendingRequests.get(key);
+    if (!entry) {
+      await updateApprovalStatus(sessionId, requestId, status).catch(() => undefined);
+      return;
+    }
+    this.pendingRequests.delete(key);
+    clearTimeout(entry.timeout);
+    const updated = { ...entry.request, status, updatedAt: new Date().toISOString() };
+    await writeApprovalRequest(updated);
+    entry.resolve(status);
+  }
+}
 
 export async function markTuiAttached(sessionId: string): Promise<void> {
   await mkdir(approvalDir(sessionId), { recursive: true });
@@ -102,6 +200,10 @@ export async function respondToApproval(sessionId: string, requestId: string, ap
 async function updateApprovalStatus(sessionId: string, requestId: string, status: ApprovalStatus): Promise<void> {
   const request = await readApprovalRequest(sessionId, requestId);
   await writeApprovalRequest({ ...request, status, updatedAt: new Date().toISOString() });
+}
+
+function memoryKey(sessionId: string, requestId: string): string {
+  return `${sessionId}:${requestId}`;
 }
 
 async function readApprovalRequest(sessionId: string, requestId: string): Promise<PermissionApprovalRequest> {

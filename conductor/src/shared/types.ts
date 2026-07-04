@@ -22,10 +22,13 @@ export interface WorkspaceProfile {
   repoPath: string;
   backend: BackendConfig;
   defaultMode?: WorkspaceMode;
+  permissionMode?: "safe" | "trusted";
+  httpPort?: number;
   toolPolicy?: ToolPolicy;
   tunnel?: {
     provider: "cloudflared" | "none";
     hostname?: string;
+    enabled?: boolean;
   };
   adapters?: string[];
 }
@@ -106,6 +109,7 @@ export interface SessionStartedEvent {
   ts: string;
   sessionId: string;
   type: "session_started";
+  owner?: "stdio" | "tui";
   workspacePath: string;
   defaultMode: WorkspaceMode;
   backendType: BackendConfig["type"];

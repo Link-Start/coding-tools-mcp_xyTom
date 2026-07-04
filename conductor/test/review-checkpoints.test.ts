@@ -47,11 +47,19 @@ describe("ReviewManager", () => {
 });
 
 class ExecBackend implements ReviewToolCaller {
+  commands: string[] = [];
+
   async callTool(name: string, args: Record<string, unknown>): Promise<CallToolResult> {
     if (name !== "exec_command") throw new Error(`Unexpected tool ${name}`);
     const command = String(args.cmd);
+    if (/\$\(|\$\{|`|\n|\|\||\btrap\b|\bset -e\b/.test(command)) {
+      throw new Error(`Unsafe shell feature used by test command: ${command}`);
+    }
+    this.commands.push(command);
     const workdir = String(args.workdir);
-    const result = await execa("bash", ["-lc", command], { cwd: workdir, reject: false });
+    const envArg = args.env;
+    const env = envArg && typeof envArg === "object" && !Array.isArray(envArg) ? (envArg as Record<string, string>) : undefined;
+    const result = await execa("bash", ["-lc", command], { cwd: workdir, env, reject: false });
     return {
       content: [{ type: "text", text: result.stdout }],
       structuredContent: {

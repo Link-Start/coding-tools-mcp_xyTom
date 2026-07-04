@@ -793,6 +793,14 @@ Output schema:
     "stderr_truncated": { "type": "boolean" },
     "summary": { "type": "string" },
     "output_ref": { "type": "string" },
+    "output_stream": { "type": "string", "enum": ["stdout", "stderr"] },
+    "output_refs": {
+      "type": "object",
+      "properties": {
+        "stdout": { "type": "string" },
+        "stderr": { "type": "string" }
+      }
+    },
     "preview": { "type": "string" },
     "preview_truncated": { "type": "boolean" },
     "elapsed_ms": { "type": "integer" },
@@ -821,7 +829,7 @@ Policy requirements:
 - `rm -rf /`, `git reset --hard`, broad `chmod`/`chown`, and similar destructive commands must not execute without explicit permission.
 - Linux Landlock confinement must be applied when available. Safe and trusted modes must add only the exact external runtime directory as the extra non-workspace writable root. If Landlock is unavailable, `exec_command` must continue to run under policy checks and include a warning that an external sandbox is required for untrusted commands.
 - `exec_command` may include `diagnostics` with machine-readable error attribution while preserving raw stdout, stderr, and exit code.
-- When `verbosity` is `summary` or `preview`, `exec_command` omits raw `stdout` and `stderr` from the immediate response, returns `summary` plus `output_ref`, and callers can use `read_output` to page retained output. `preview` additionally returns a bounded `preview` string.
+- When `verbosity` is `summary` or `preview`, `exec_command` omits raw `stdout` and `stderr` from the immediate response, returns `summary` plus stream-specific `output_refs`, and callers can use `read_output` to page retained stdout/stderr independently. `output_ref` points at the primary stream for convenience. `preview` additionally returns a bounded combined preview string.
 - Long-running commands return `ok: true`, `status: "running"`, and `session_id`.
 - Timed-out commands must clean up their process group.
 
@@ -876,6 +884,14 @@ Output schema:
     "stderr_truncated": { "type": "boolean" },
     "summary": { "type": "string" },
     "output_ref": { "type": "string" },
+    "output_stream": { "type": "string", "enum": ["stdout", "stderr"] },
+    "output_refs": {
+      "type": "object",
+      "properties": {
+        "stdout": { "type": "string" },
+        "stderr": { "type": "string" }
+      }
+    },
     "preview": { "type": "string" },
     "preview_truncated": { "type": "boolean" },
     "warnings": { "type": "array", "items": { "type": "string" } },
@@ -937,6 +953,14 @@ Output schema:
     "stderr": { "type": "string" },
     "summary": { "type": "string" },
     "output_ref": { "type": "string" },
+    "output_stream": { "type": "string", "enum": ["stdout", "stderr"] },
+    "output_refs": {
+      "type": "object",
+      "properties": {
+        "stdout": { "type": "string" },
+        "stderr": { "type": "string" }
+      }
+    },
     "preview": { "type": "string" },
     "preview_truncated": { "type": "boolean" },
     "warnings": { "type": "array", "items": { "type": "string" } },
@@ -954,7 +978,7 @@ observe later watchdog completion. Sessions are evicted only after terminal proc
 
 ### read_output
 
-Description: Read retained command output by `output_ref` with byte-offset pagination.
+Description: Read retained stdout or stderr by stream-specific `output_ref` with absolute byte-offset pagination.
 
 Annotations:
 
@@ -975,6 +999,7 @@ Input schema:
   "type": "object",
   "properties": {
     "output_ref": { "type": "string", "minLength": 1 },
+    "stream": { "type": "string", "enum": ["stdout", "stderr"] },
     "offset": { "type": "integer", "minimum": 0, "default": 0 },
     "limit": { "type": "integer", "minimum": 1, "maximum": 1048576, "default": 4096 }
   },
@@ -991,13 +1016,20 @@ Output schema:
   "properties": {
     "ok": { "type": "boolean" },
     "output_ref": { "type": "string" },
+    "stream_output_ref": { "type": "string" },
+    "stream": { "type": "string", "enum": ["stdout", "stderr"] },
     "offset": { "type": "integer" },
+    "requested_offset": { "type": "integer" },
     "limit": { "type": "integer" },
     "content": { "type": "string" },
     "next_offset": { "type": ["integer", "null"] },
     "total_retained_bytes": { "type": "integer" },
+    "retained_start_offset": { "type": "integer" },
+    "total_stream_bytes": { "type": "integer" },
     "stdout_dropped_bytes": { "type": "integer" },
     "stderr_dropped_bytes": { "type": "integer" },
+    "stream_dropped_bytes": { "type": "integer" },
+    "omitted_bytes": { "type": "integer" },
     "truncated": { "type": "boolean" },
     "warnings": { "type": "array", "items": { "type": "string" } },
     "error": { "$ref": "#/$defs/tool_error" }
@@ -1006,7 +1038,7 @@ Output schema:
 }
 ```
 
-`output_ref` values are returned by session tools when compact verbosity is requested. Retention is bounded by the server's rolling session buffer and recent-output cache.
+`output_refs.stdout` and `output_refs.stderr` values are returned by session tools when compact verbosity is requested. `offset` and `next_offset` are absolute per-stream byte positions, so stdout growth cannot shift stderr pagination and vice versa. Retention is bounded by the server's rolling session buffer and recent-output cache.
 
 ### git_status
 

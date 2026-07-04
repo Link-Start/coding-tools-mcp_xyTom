@@ -13,7 +13,11 @@ const program = new Command();
 program
   .name("ctc")
   .description("Coding Tools Conductor")
-  .version("0.1.0");
+  .version("0.1.0")
+  .argument("[path]", "workspace path for the initial TUI workspace")
+  .action(async (path: string | undefined) => {
+    await runTui({ initialWorkspacePath: path ?? process.cwd() });
+  });
 
 program
   .command("setup")
@@ -75,9 +79,10 @@ program
 program
   .command("tui")
   .argument("[session-id]", "session id to attach; defaults to the latest log")
-  .description("attach a read-only Ink TUI to a running or recent ctc session")
+  .description("deprecated alias for ctc; attaches to a v1 session when a session id is provided")
   .action(async (sessionId: string | undefined) => {
-    await runTui(sessionId);
+    process.stderr.write("ctc: `ctc tui` is deprecated; use `ctc` to open the TUI.\n");
+    await runTui({ requestedSessionId: sessionId, initialWorkspacePath: process.cwd() });
   });
 
 const ws = program.command("ws").description("manage ctc worktree workspaces");

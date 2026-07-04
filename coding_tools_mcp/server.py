@@ -607,7 +607,7 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
     ),
     "read_output": ToolSpec(
         title="Read output",
-        description="Read retained command output by output_ref with byte offset pagination.",
+        description="Read retained stdout or stderr by output_ref with per-stream byte offset pagination.",
         read_only=True,
         idempotent=True,
         in_read_only_profile=True,
@@ -1491,6 +1491,24 @@ class ExecSession:
                 sections.append(b"\n")
             sections.extend([b"--- stderr ---\n", stderr])
         return b"".join(sections)
+
+    def retained_stream_bytes(self, stream: str) -> tuple[bytes, int, int, int]:
+        with self.lock:
+            if stream == "stdout":
+                return (
+                    bytes(self.stdout),
+                    self.stdout_start_offset,
+                    self.stdout_total_bytes,
+                    self.stdout_dropped_bytes,
+                )
+            if stream == "stderr":
+                return (
+                    bytes(self.stderr),
+                    self.stderr_start_offset,
+                    self.stderr_total_bytes,
+                    self.stderr_dropped_bytes,
+                )
+        raise ValueError(f"Unknown output stream: {stream}")
 
 
 class Runtime:
@@ -2734,6 +2752,7 @@ class Runtime:
 
     def _remember_output_session(self, session: ExecSession) -> None:
         with self.sessions_lock:
+            self.output_sessions.pop(session.session_id, None)
             self.output_sessions[session.session_id] = session
             while len(self.output_sessions) > MAX_RETAINED_OUTPUT_SESSIONS:
                 oldest = next(iter(self.output_sessions))
@@ -2757,9 +2776,16 @@ class Runtime:
                 category="validation",
             )
         self._remember_output_session(session)
-        output_ref = f"session:{session.session_id}:full"
+        output_refs = {
+            "stdout": f"session:{session.session_id}:stdout",
+            "stderr": f"session:{session.session_id}:stderr",
+        }
+        output_stream = "stderr" if not payload.get("stdout") and payload.get("stderr") else "stdout"
+        output_ref = output_refs[output_stream]
         payload["summary"] = self._session_output_summary(session, payload)
         payload["output_ref"] = output_ref
+        payload["output_stream"] = output_stream
+        payload["output_refs"] = output_refs
         if verbosity == "full":
             return payload
         compact = {
@@ -2805,30 +2831,56 @@ class Runtime:
 
     def read_output(self, args: dict[str, Any]) -> dict[str, Any]:
         output_ref = str(args.get("output_ref", ""))
-        match = re.fullmatch(r"session:([^:]+):full", output_ref)
+        match = re.fullmatch(r"session:([^:]+):(full|stdout|stderr)", output_ref)
         if not match:
-            raise ToolFailure("INVALID_ARGUMENT", "output_ref must look like session:<id>:full.", category="validation")
+            raise ToolFailure(
+                "INVALID_ARGUMENT",
+                "output_ref must look like session:<id>:stdout or session:<id>:stderr.",
+                category="validation",
+            )
         session = self._get_output_session(match.group(1))
         session.refresh_status()
-        data = session.retained_output_bytes()
-        offset = max(0, int(args.get("offset", 0)))
+        ref_stream = match.group(2)
+        requested_stream = str(args.get("stream", "") or "")
+        if requested_stream and requested_stream not in {"stdout", "stderr"}:
+            raise ToolFailure("INVALID_ARGUMENT", "stream must be stdout or stderr.", category="validation")
+        if ref_stream in {"stdout", "stderr"} and requested_stream and requested_stream != ref_stream:
+            raise ToolFailure("INVALID_ARGUMENT", "stream does not match output_ref.", category="validation")
+        stream = ref_stream if ref_stream in {"stdout", "stderr"} else requested_stream or "stdout"
+        data, retained_start_offset, total_stream_bytes, dropped_bytes = session.retained_stream_bytes(stream)
+        requested_offset = max(0, int(args.get("offset", 0)))
+        offset = max(requested_offset, retained_start_offset)
         limit = max(1, min(int(args.get("limit", EXEC_PREVIEW_BYTES)), SESSION_BUFFER_BYTES))
-        chunk = data[offset : offset + limit]
-        next_offset = offset + len(chunk) if offset + len(chunk) < len(data) else None
+        buffer_offset = max(0, offset - retained_start_offset)
+        chunk = data[buffer_offset : buffer_offset + limit]
+        next_offset = offset + len(chunk) if offset + len(chunk) < total_stream_bytes else None
+        omitted_bytes = max(0, retained_start_offset - requested_offset)
+        warnings: list[str] = []
+        if omitted_bytes:
+            warnings.append(f"{stream} offset skipped dropped bytes")
+        if dropped_bytes:
+            warnings.append(f"older {stream} output was dropped from the rolling session buffer")
+        if ref_stream == "full":
+            warnings.append("legacy full output_ref defaults to stdout; use output_refs for stable stream paging")
         return {
             "output_ref": output_ref,
+            "stream_output_ref": f"session:{session.session_id}:{stream}",
+            "stream": stream,
             "offset": offset,
+            "requested_offset": requested_offset,
             "limit": limit,
             "content": chunk.decode("utf-8", errors="replace"),
             "next_offset": next_offset,
             "total_retained_bytes": len(data),
+            "retained_start_offset": retained_start_offset,
+            "total_stream_bytes": total_stream_bytes,
             "stdout_dropped_bytes": session.stdout_dropped_bytes,
             "stderr_dropped_bytes": session.stderr_dropped_bytes,
+            "stream_dropped_bytes": dropped_bytes,
+            "omitted_bytes": omitted_bytes,
             "truncated": next_offset is not None,
             "ok": True,
-            "warnings": ["older output was dropped from the rolling session buffer"]
-            if session.stdout_dropped_bytes or session.stderr_dropped_bytes
-            else [],
+            "warnings": warnings,
         }
 
     def write_stdin(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -4771,6 +4823,7 @@ def input_schemas() -> dict[str, dict[str, Any]]:
         "read_output": object_schema(
             {
                 "output_ref": {**string, "minLength": 1},
+                "stream": {**string, "enum": ["stdout", "stderr"]},
                 "offset": {**integer, "minimum": 0, "default": 0},
                 "limit": {**integer, "minimum": 1, "maximum": 1048576, "default": 4096},
             },

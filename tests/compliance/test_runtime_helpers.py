@@ -4,6 +4,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 import unittest
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -689,11 +690,72 @@ Maven home: /usr/share/maven
             self.assertIn("summary", result)
             self.assertIn("preview", result)
             self.assertIn("output_ref", result)
+            self.assertIn("output_refs", result)
+            self.assertEqual(result.get("output_stream"), "stdout")
             self.assertNotIn("stdout", result)
             page = runtime.read_output({"output_ref": result["output_ref"], "offset": 0, "limit": 128})
             self.assertIn("alpha", page.get("content", ""))
             self.assertIn("beta", page.get("content", ""))
+            self.assertEqual(page.get("stream"), "stdout")
             self.assertIsNone(page.get("next_offset"))
+
+    def test_read_output_pages_streams_independently(self) -> None:
+        with TemporaryDirectory() as tmp:
+            runtime = Runtime(Path(tmp), permission_mode="trusted")
+            script = (
+                "import sys,time;"
+                "sys.stderr.write('err1\\nerr2\\n'); sys.stderr.flush();"
+                "sys.stdout.write('out1\\n'); sys.stdout.flush();"
+                "time.sleep(0.4);"
+                "sys.stdout.write('out2\\n'); sys.stdout.flush();"
+                "time.sleep(1)"
+            )
+            result = runtime.exec_command(
+                {
+                    "cmd": f"{sys.executable} -c {script!r}",
+                    "timeout_ms": 5000,
+                    "yield_time_ms": 100,
+                    "verbosity": "preview",
+                    "preview_bytes": 64,
+                }
+            )
+            self.assertEqual(result.get("status"), "running", result)
+            output_refs = result.get("output_refs")
+            self.assertIsInstance(output_refs, dict)
+            stderr_ref = output_refs["stderr"]
+
+            first: dict[str, object] = {}
+            for _ in range(10):
+                first = runtime.read_output({"output_ref": stderr_ref, "offset": 0, "limit": 5})
+                if first.get("content"):
+                    break
+                time.sleep(0.05)
+            self.assertEqual(first.get("content"), "err1\n")
+            self.assertEqual(first.get("next_offset"), 5)
+            time.sleep(0.6)
+            second = runtime.read_output({"output_ref": stderr_ref, "offset": first["next_offset"], "limit": 64})
+            self.assertEqual(second.get("offset"), first.get("next_offset"))
+            self.assertEqual(second.get("content"), "err2\n")
+            self.assertNotIn("out2", second.get("content", ""))
+            runtime.kill_session({"session_id": result["session_id"], "wait_ms": 1000})
+
+    def test_read_output_uses_absolute_stream_offsets_after_buffer_drop(self) -> None:
+        with TemporaryDirectory() as tmp:
+            runtime = Runtime(Path(tmp), permission_mode="trusted")
+            process = subprocess.Popen([sys.executable, "-c", ""], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            try:
+                session = server_module.ExecSession(session_id="manual-output", process=process, buffer_limit=4)
+                session.append_stdout(b"abcdef")
+                runtime._remember_output_session(session)
+
+                page = runtime.read_output({"output_ref": "session:manual-output:stdout", "offset": 0, "limit": 10})
+                self.assertEqual(page.get("offset"), 2)
+                self.assertEqual(page.get("requested_offset"), 0)
+                self.assertEqual(page.get("content"), "cdef")
+                self.assertEqual(page.get("omitted_bytes"), 2)
+                self.assertEqual(page.get("retained_start_offset"), 2)
+            finally:
+                process.wait(timeout=5)
 
     def test_default_cwd_and_git_convenience_tools(self) -> None:
         if server_module.shutil.which("git") is None:
