@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from coding_tools_mcp import processes
+from coding_tools_mcp import server
 from coding_tools_mcp.errors import ToolFailure
 from coding_tools_mcp.server import Runtime, ShellEnvPolicy
 
@@ -203,6 +204,89 @@ class WindowsPowerShellPolicyTests(unittest.TestCase):
                             raised.exception.details.get("permission"),
                             "destructive_command",
                         )
+            finally:
+                runtime.close()
+
+
+class WindowsPowerShellDynamicSyntaxTests(unittest.TestCase):
+    """PowerShell resolves commands at runtime, so cmdlet-name scanning alone
+    cannot decide whether a command is destructive or reaches the network."""
+
+    def assert_policy(self, command: str, *, mode: str = "safe") -> ToolFailure | None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = Runtime(Path(tmp), permission_mode=mode)
+            try:
+                with patch.object(server, "powershell_executes_string_commands", return_value=True):
+                    try:
+                        runtime._check_command_policy(command, {})
+                    except ToolFailure as failure:
+                        return failure
+            finally:
+                runtime.close()
+        return None
+
+    def test_safe_mode_gates_command_names_built_from_variables_and_splatting(self) -> None:
+        # Both of these pass every cmdlet-name scan while still invoking a
+        # network download and a recursive delete.
+        cases = {
+            "$c='Invoke-WebRequest'; & $c example.com": "expansion",
+            "$p=@{Recurse=$true}; Remove-Item . @p": "expansion",
+            "Set-Alias grab Invoke-WebRequest; grab example.com": "dynamic_eval",
+            "[IO.File]::Delete('C:\\data\\report.csv')": "static_member",
+            "Remove-Item . @args": "splatting",
+            ". .\\payload.ps1": "call_operator",
+            "iex (Get-Content payload.txt -Raw)": "dynamic_eval",
+        }
+        for command, construct in cases.items():
+            with self.subTest(command=command):
+                failure = self.assert_policy(command)
+                self.assertIsNotNone(failure, f"{command!r} was allowed in safe mode")
+                assert failure is not None
+                self.assertEqual(failure.details.get("permission"), "shell_expansion")
+                self.assertEqual(failure.details.get("construct"), construct)
+
+    def test_safe_mode_gates_nested_shells_that_smuggle_encoded_scripts(self) -> None:
+        for command in (
+            "pwsh -EncodedCommand SQBuAHYAbwBrAGUA",
+            "pwsh -enc SQBuAHYAbwBrAGUA",
+            "pwsh -Command Invoke-WebRequest example.com",
+            "powershell.exe -c whoami",
+            "cmd /c del /s /q C:\\data",
+        ):
+            with self.subTest(command=command):
+                failure = self.assert_policy(command)
+                self.assertIsNotNone(failure, f"{command!r} was allowed in safe mode")
+                assert failure is not None
+                self.assertEqual(failure.details.get("permission"), "inline_script")
+
+    def test_safe_mode_still_allows_literal_powershell_commands(self) -> None:
+        for command in (
+            "Get-ChildItem -Path src -Recurse -Name",
+            "Write-Output ok",
+            "git commit -m 'fix parser' && git log --oneline -1",
+            "git config user.email dev@example.com",
+            ".\\build.exe --release",
+            "Get-Content README.md | Select-String planet.txt",
+        ):
+            with self.subTest(command=command):
+                self.assertIsNone(self.assert_policy(command), f"{command!r} was blocked in safe mode")
+
+    def test_trusted_mode_allows_dynamic_syntax(self) -> None:
+        for command in ("$c='Get-Date'; & $c", "Remove-Item . @p"):
+            with self.subTest(command=command):
+                self.assertIsNone(self.assert_policy(command, mode="trusted"))
+
+    def test_network_scan_does_not_flag_words_ending_in_net(self) -> None:
+        self.assertIsNone(server.POWERSHELL_NETWORK_RE.search("Get-Content planet.txt"))
+        self.assertIsNotNone(server.POWERSHELL_NETWORK_RE.search("New-Object System.Net.WebClient"))
+        self.assertIsNotNone(server.POWERSHELL_NETWORK_RE.search("[Net.Dns]::GetHostAddresses('a')"))
+
+    def test_posix_hosts_keep_their_existing_expansion_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = Runtime(Path(tmp), permission_mode="safe")
+            try:
+                with patch.object(server, "powershell_executes_string_commands", return_value=False):
+                    runtime._check_command_policy("echo $HOME", {})
             finally:
                 runtime.close()
 

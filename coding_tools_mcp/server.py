@@ -182,7 +182,7 @@ NETWORK_RE = re.compile(
 POWERSHELL_NETWORK_RE = re.compile(
     r"(?:^|[;&|{}\r\n])\s*(?:Invoke-WebRequest|Invoke-RestMethod|Start-BitsTransfer|"
     r"Test-NetConnection|Test-Connection|Resolve-DnsName|iwr|irm|tnc|ping(?:\.exe)?|"
-    r"nslookup(?:\.exe)?|tracert(?:\.exe)?)\b|(?:System\.)?Net\.",
+    r"nslookup(?:\.exe)?|tracert(?:\.exe)?)\b|\b(?:System\.)?Net\.",
     re.I,
 )
 SHELL_EXPANSION_RE = re.compile(r"(`|\$\(|\$\{)")
@@ -193,6 +193,20 @@ DESTRUCTIVE_RE = re.compile(
 POWERSHELL_DESTRUCTIVE_RE = re.compile(
     r"(?:^|[;&|{}\r\n])\s*(?:Remove-Item|rm|ri|del|erase|rmdir|rd)\b"
     r"(?=[^;&|{}\r\n]*\s-(?:r|re|rec|recu|recur|recurs|recurse)\b)",
+    re.I,
+)
+# PowerShell resolves commands at runtime, so scanning for cmdlet names cannot
+# see through a variable, a splatted parameter set, a redefined alias, or a
+# .NET member call. Any of those constructs makes the destructive and network
+# scans above unsound, so they require the same explicit permission that POSIX
+# command substitution already requires instead of being scanned for keywords.
+POWERSHELL_DYNAMIC_RE = re.compile(
+    r"(?P<expansion>\$)"
+    r"|(?P<splatting>(?:^|[\s;&|(){},=])@)"
+    r"|(?P<static_member>::)"
+    r"|(?P<call_operator>(?:^|[;|(){}\r\n]|&&|\|\|)\s*(?:&(?!&)|\.)\s)"
+    r"|(?P<dynamic_eval>\b(?:Invoke-Expression|iex|Invoke-Command|icm|New-Object|"
+    r"Add-Type|Set-Alias|New-Alias|sal|nal)\b)",
     re.I,
 )
 MAX_HTTP_REQUEST_BYTES = 1_048_576
@@ -2531,6 +2545,24 @@ class Runtime:
                 category="permission",
                 details={"permission": "network", "command": compact},
             )
+        # Runs last so a command the scans above already recognized keeps its
+        # precise permission label; this is the catch-all for the PowerShell
+        # syntax that makes those scans unsound in the first place.
+        if not self.capabilities.shell_expansion and powershell_executes_string_commands():
+            construct = powershell_dynamic_construct(cmd)
+            if construct is not None:
+                raise ToolFailure(
+                    "PERMISSION_REQUIRED",
+                    "PowerShell dynamic syntax requires explicit permission because the command "
+                    "a variable, splat, alias, or .NET member resolves to cannot be verified "
+                    "statically.",
+                    category="permission",
+                    details={
+                        "permission": "shell_expansion",
+                        "construct": construct,
+                        "command": compact,
+                    },
+                )
 
     def _add_exec_diagnostics(self, payload: dict[str, Any]) -> None:
         diagnostics = exec_output_diagnostics(payload)
@@ -3764,6 +3796,20 @@ def inline_script_segment(command: str | None, args: list[str]) -> dict[str, str
                 return {"command": name, "option": option}
     if name in {"ruby", "perl"} and "-e" in args:
         return {"command": name, "option": "-e"}
+    if name in {"pwsh", "pwsh.exe", "powershell", "powershell.exe"}:
+        for arg in args:
+            if not arg.startswith("-"):
+                continue
+            option = arg.lstrip("-").lower()
+            # PowerShell accepts any unambiguous prefix, so -e, -enc, and
+            # -EncodedCommand all smuggle a base64 script past text scanning.
+            if option and ("command".startswith(option) or "encodedcommand".startswith(option)):
+                return {"command": name, "option": arg}
+        return None
+    if name in {"cmd", "cmd.exe"}:
+        for arg in args:
+            if arg.lstrip("-/").lower() in {"c", "k"}:
+                return {"command": name, "option": arg}
     return None
 
 
@@ -3916,6 +3962,24 @@ def is_inspectable_path_argument(token: str) -> bool:
     if "/" in normalized:
         return True
     return "." in PurePosixPath(normalized).name
+
+
+def powershell_executes_string_commands() -> bool:
+    """True when this host runs string commands through PowerShell 7.
+
+    Mirrors the spawn decision in processes.spawn_process, which wraps Windows
+    string commands in pwsh. Command policy has to agree with that decision:
+    PowerShell syntax is only worth gating where PowerShell is the interpreter.
+    """
+
+    return os.name == "nt"
+
+
+def powershell_dynamic_construct(command: str) -> str | None:
+    match = POWERSHELL_DYNAMIC_RE.search(command)
+    if match is None:
+        return None
+    return match.lastgroup
 
 
 def is_literal_network_reference_command(command: str) -> bool:

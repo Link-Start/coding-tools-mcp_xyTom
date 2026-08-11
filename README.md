@@ -77,6 +77,12 @@ On Windows, string commands run through PowerShell 7 (`pwsh`) with
 the launcher. The server reports `SHELL_NOT_FOUND` or
 `SHELL_VERSION_UNSUPPORTED` instead of falling back to `cmd.exe`.
 
+Because PowerShell resolves commands at runtime, `safe` mode on Windows gates
+dynamic syntax — variables, splatting, call and dot-source operators, `::`
+member access, alias/expression evaluation, and nested shells — behind the
+`shell_expansion` and `inline_script` permissions. Literal commands are
+unaffected; use `request_permissions` or `trusted` mode for the rest.
+
 ## Seven things to try
 
 **1. Make Claude Desktop your coding agent.** The config above is all it
