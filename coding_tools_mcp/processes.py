@@ -9,7 +9,7 @@ import threading
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any, BinaryIO
+from typing import Any, BinaryIO, Literal
 
 from .errors import ToolFailure
 from .textutils import DEFAULT_MAX_LINES, TextTruncation, truncate_text_tail
@@ -23,6 +23,22 @@ COMMAND_BUFFER_BYTES = 524_288
 COMMAND_HEAD_BUFFER_DIVISOR = 8
 HARD_KILL_SIGNAL = getattr(signal, "SIGKILL", signal.SIGTERM)
 PWSH_PATH_ENV = "CODING_TOOLS_MCP_PWSH_PATH"
+CMD_FALLBACK_WARNING = (
+    "PowerShell 7 (pwsh) is unavailable; exec_command is using the cmd.exe "
+    "compatibility fallback. Commands use cmd.exe syntax, not PowerShell syntax. "
+    "Install PowerShell 7 or set CODING_TOOLS_MCP_PWSH_PATH to use PowerShell."
+)
+
+
+@dataclass(frozen=True)
+class WindowsCommandShell:
+    """Trusted Windows command interpreter selected by the server."""
+
+    kind: Literal["pwsh", "cmd"]
+    executable: str
+    fallback: bool = False
+    fallback_reason: str | None = None
+    warning: str | None = None
 
 
 def _environment_value(env: Mapping[str, str], target: str) -> str | None:
@@ -93,7 +109,7 @@ def resolve_pwsh() -> str:
     if executable is None:
         raise ToolFailure(
             "SHELL_NOT_FOUND",
-            "PowerShell 7 is required for Windows string commands, but pwsh was not found on PATH.",
+            "PowerShell 7 was not found on the server process PATH.",
             category="runtime",
             details={
                 "executable": "pwsh",
@@ -112,6 +128,109 @@ def resolve_pwsh() -> str:
             details={"executable": executable, "major_version": major, "required_major_version": 7},
         )
     return executable
+
+
+def resolve_cmd() -> str:
+    """Resolve cmd.exe from trusted server-process Windows locations."""
+
+    raw_candidates: list[str] = []
+    comspec = (_environment_value(os.environ, "COMSPEC") or "").strip().strip('"')
+    if comspec:
+        raw_candidates.append(comspec)
+    for variable in ("SYSTEMROOT", "WINDIR"):
+        root = (_environment_value(os.environ, variable) or "").strip().strip('"')
+        if root:
+            raw_candidates.append(ntpath.join(root, "System32", "cmd.exe"))
+
+    seen: set[str] = set()
+    for raw_candidate in raw_candidates:
+        candidate = ntpath.normpath(ntpath.expandvars(raw_candidate))
+        normalized = ntpath.normcase(candidate)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        if (
+            ntpath.isabs(candidate)
+            and ntpath.basename(candidate).lower() == "cmd.exe"
+            and os.path.isfile(candidate)
+        ):
+            return candidate
+
+    executable = _find_windows_executable_on_path(
+        "cmd.exe",
+        _environment_value(os.environ, "PATH"),
+    )
+    if executable is not None:
+        return executable
+    raise ToolFailure(
+        "SHELL_NOT_FOUND",
+        "Neither PowerShell 7 nor cmd.exe could be resolved for Windows string commands.",
+        category="runtime",
+        details={
+            "executable": "cmd.exe",
+            "retry_hint": (
+                "Restore the Windows command processor or install PowerShell 7 and add "
+                f"pwsh to PATH (or set {PWSH_PATH_ENV})."
+            ),
+        },
+    )
+
+
+def resolve_windows_command_shell() -> WindowsCommandShell:
+    """Prefer PowerShell 7 and automatically retain cmd.exe compatibility."""
+
+    configured_pwsh = bool((_environment_value(os.environ, PWSH_PATH_ENV) or "").strip())
+    try:
+        return WindowsCommandShell(kind="pwsh", executable=resolve_pwsh())
+    except ToolFailure as exc:
+        # An explicit pin is operator intent. Falling back would hide a typo or
+        # silently ignore a version constraint the operator expected to hold.
+        if configured_pwsh:
+            raise
+        return WindowsCommandShell(
+            kind="cmd",
+            executable=resolve_cmd(),
+            fallback=True,
+            fallback_reason=exc.code,
+            warning=CMD_FALLBACK_WARNING,
+        )
+
+
+_selected_shell_lock = threading.Lock()
+_selected_shell: WindowsCommandShell | ToolFailure | None = None
+
+
+def selected_windows_command_shell(*, refresh: bool = False) -> WindowsCommandShell:
+    """Resolve the Windows shell once per process and pin the answer.
+
+    Re-resolving per call would let a transient probe failure flip one exec to
+    cmd.exe while the next uses pwsh, and would let concurrent requests each
+    start their own multi-second version probe before command accounting sees
+    them. The lock serializes the first resolution; every later call reuses the
+    pinned selection (including a pinned failure) until ``refresh`` — used by
+    check_exec_environment so operators can pick up a newly installed shell
+    without restarting the server.
+    """
+
+    global _selected_shell
+    with _selected_shell_lock:
+        if refresh or _selected_shell is None:
+            try:
+                _selected_shell = resolve_windows_command_shell()
+            except ToolFailure as failure:
+                _selected_shell = failure
+        pinned = _selected_shell
+    if isinstance(pinned, ToolFailure):
+        raise pinned
+    return pinned
+
+
+def _reset_selected_windows_command_shell() -> None:
+    """Drop the pinned shell selection (test seam)."""
+
+    global _selected_shell
+    with _selected_shell_lock:
+        _selected_shell = None
 
 
 @functools.lru_cache(maxsize=16)
@@ -172,6 +291,20 @@ def build_pwsh_argv(executable: str, command: str) -> list[str]:
     ]
 
 
+def build_cmd_command_line(executable: str, command: str) -> str:
+    """Build the exact cmd.exe command line, bypassing MS CRT argv quoting.
+
+    Passing an argument list would make Popen serialize it with list2cmdline,
+    whose ``\\"`` escapes reach cmd.exe verbatim and corrupt any command that
+    contains quotes. ``/S /C`` is specified against a raw command line instead:
+    cmd strips the first and last quote and executes everything between them
+    unchanged, so the payload needs exactly one enclosing quote pair and no
+    further escaping.
+    """
+
+    return f'"{executable}" /D /V:OFF /S /C "{command}"'
+
+
 def terminate_process_group(
     process: subprocess.Popen[bytes],
     signum: signal.Signals,
@@ -220,12 +353,17 @@ def spawn_process(
     env: dict[str, str],
     tty: bool,
     popen_kwargs: dict[str, Any],
+    windows_shell: WindowsCommandShell | None = None,
 ) -> tuple[subprocess.Popen[bytes], int | None]:
     """Spawn a pipe-backed or true POSIX PTY-backed process."""
 
     if not tty:
         if os.name == "nt" and shell and isinstance(command, str):
-            command = build_pwsh_argv(resolve_pwsh(), command)
+            selected_shell = windows_shell or selected_windows_command_shell()
+            if selected_shell.kind == "pwsh":
+                command = build_pwsh_argv(selected_shell.executable, command)
+            else:
+                command = build_cmd_command_line(selected_shell.executable, command)
             shell = False
         process = subprocess.Popen(
             command,

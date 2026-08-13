@@ -74,17 +74,21 @@ walkthroughs, and troubleshooting live in
 [docs/quickstart.md](docs/quickstart.md) and
 [docs/mcp-client-config.md](docs/mcp-client-config.md).
 
-On Windows, string commands run through PowerShell 7 (`pwsh`) with
-`-NoLogo -NoProfile -NonInteractive`. Set
-`CODING_TOOLS_MCP_PWSH_PATH` to an absolute trusted `pwsh.exe` path to pin
-the launcher. The server reports `SHELL_NOT_FOUND` or
-`SHELL_VERSION_UNSUPPORTED` instead of falling back to `cmd.exe`.
+On Windows, string commands prefer PowerShell 7 (`pwsh`) with
+`-NoLogo -NoProfile -NonInteractive`. If `pwsh` is unavailable, the server
+automatically preserves command execution through a trusted `cmd.exe`
+compatibility fallback. `server_info`, `check_exec_environment`, and each
+`exec_command` result disclose the selected shell so agents can use the right
+syntax. Set `CODING_TOOLS_MCP_PWSH_PATH` to an absolute trusted `pwsh.exe` path
+to pin PowerShell; an invalid explicit pin is reported instead of ignored.
 
 Because PowerShell resolves commands at runtime, `safe` mode on Windows gates
 dynamic syntax — variables, splatting, call and dot-source operators, `::`
 member access, alias/expression evaluation, and nested shells — behind the
 `shell_expansion` and `inline_script` permissions. Literal commands are
-unaffected; use `request_permissions` or `trusted` mode for the rest.
+unaffected; use `request_permissions` or `trusted` mode for the rest. Under the
+`cmd.exe` fallback, percent expansion, caret escaping, and `CALL`/`FOR`
+evaluation likewise require `shell_expansion`.
 
 ## Seven things to try
 
@@ -134,8 +138,8 @@ clipboard helpers, live health checks. English and 简体中文.
 debugger under a real POSIX PTY; `write_stdin` feeds it across turns;
 `read_output` pages long output; `kill_command` cleans up. Long-running
 processes are first-class, with deadline watchdogs and bounded buffers.
-Windows uses PowerShell 7 for non-TTY commands; ConPTY remains a separate
-limitation.
+Windows prefers PowerShell 7 and otherwise uses the disclosed `cmd.exe`
+fallback for non-TTY commands; ConPTY remains a separate limitation.
 
 **7. Give your own agent production-grade hands.** Building an agent loop with
 the Anthropic SDK or anything else? Don't hand-roll file and exec tools —
