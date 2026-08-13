@@ -2,9 +2,9 @@ name: compliance
 
 on:
   push:
-    branches: [main, "recover-*", "release/**", "hotfix/**"]
+    branches: [main, "recover-*"]
   pull_request:
-    branches: [main, "release/**"]
+    branches: [main]
   workflow_dispatch:
   workflow_call:
 
