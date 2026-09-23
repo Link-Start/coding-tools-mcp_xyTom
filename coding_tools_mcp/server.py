@@ -36,6 +36,7 @@ from typing import Any, cast
 from . import __version__
 from .envutils import ENV_PREFIX, truthy_env
 from .errors import JsonRpcError, ToolFailure
+from .event_log import ToolEventJournal
 from .landlock_exec import libc_syscall
 from .oauth import (
     OAUTH_CODE_TTL_SECONDS,
@@ -1588,6 +1589,8 @@ class Runtime:
         )
         self.telemetry = SessionTelemetry(permission_mode=self.permission_mode, transport=transport)
         self._tool_handlers = {name: getattr(self, name) for name in TOOL_REGISTRY}
+        self._event_journal = ToolEventJournal.from_env()
+        self._journal_instance_id = secrets.token_hex(16) if self._event_journal else None
 
     def _set_runtime_dir(self, runtime_dir: Path) -> None:
         self.runtime_dir = runtime_dir
@@ -1599,9 +1602,13 @@ class Runtime:
         if self._closed:
             return
         self._closed = True
-        if self._owns_command_manager:
-            self.command_manager.close()
-        self.telemetry.finish(output_retention=self.command_manager.retention_stats_snapshot())
+        try:
+            if self._owns_command_manager:
+                self.command_manager.close()
+            self.telemetry.finish(output_retention=self.command_manager.retention_stats_snapshot())
+        finally:
+            if self._event_journal is not None:
+                self._event_journal.close()
 
     @property
     def commands(self) -> dict[str, CommandRun]:
@@ -1961,6 +1968,69 @@ class Runtime:
         }
 
     def call_tool(
+        self,
+        name: str,
+        arguments: dict[str, Any] | None,
+        *,
+        context: RequestContext | None = None,
+    ) -> dict[str, Any]:
+        journal = self._event_journal
+        if journal is None:
+            return self._call_tool(name, arguments, context=context)
+        started = time.monotonic()
+        identity = {
+            "schema_version": 1,
+            "runtime_id": self._journal_instance_id,
+            "call_id": secrets.token_hex(16),
+            "tool": name if isinstance(name, str) and name in TOOL_REGISTRY else "unknown",
+        }
+
+        def record(event: str, **fields: Any) -> None:
+            journal.record({
+                **identity,
+                "event": event,
+                "timestamp": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+                **fields,
+            })
+
+        record("tool_call_started")
+        try:
+            result = self._call_tool(name, arguments, context=context)
+        except Exception as exc:
+            fields: dict[str, Any] = {"outcome": "internal_error"}
+            if isinstance(exc, JsonRpcError):
+                fields["outcome"] = "rpc_error"
+                # Protocol codes are numbers, never arbitrary exception text.
+                if exc.code in (-32700, -32600, -32601, -32602, -32603):
+                    fields["rpc_error_code"] = exc.code
+            record("tool_call_finished", duration_ms=int((time.monotonic() - started) * 1000), **fields)
+            raise
+        # BaseException deliberately leaves an unmatched start. A record of a
+        # returned call does not mean the client received it, or a process exited.
+        payload = result.get("structuredContent", {})
+        fields = {"outcome": "tool_error" if result.get("isError") else "success"}
+        for flag in ("truncated", "idempotent_replay"):
+            if isinstance(payload.get(flag), bool):
+                fields[flag] = payload[flag]
+        operation_outcome = payload.get("operation_outcome")
+        if operation_outcome in COMMAND_OUTCOMES:
+            fields["operation_outcome"] = operation_outcome
+        error = payload.get("error")
+        if isinstance(error, dict):
+            category = error.get("category")
+            if category in ("validation", "permission", "not_found", "conflict", "runtime", "internal"):
+                fields["error_category"] = category
+        command_id = payload.get("command_id")
+        if isinstance(command_id, str):
+            # Only IDs actually owned by this runtime, not client strings or
+            # arbitrary handler output, can enter the journal.
+            with self.commands_lock:
+                if command_id in self.commands or command_id in self.output_commands:
+                    fields["command_id"] = command_id
+        record("tool_call_finished", duration_ms=int((time.monotonic() - started) * 1000), **fields)
+        return result
+
+    def _call_tool(
         self,
         name: str,
         arguments: dict[str, Any] | None,
