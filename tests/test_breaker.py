@@ -178,13 +178,6 @@ class BreakerInRuntimeTests(unittest.TestCase):
                         "patch": (
                             "*** Begin Patch\n"
                             "*** Update File: app.py\n"
-                            "@@\n"
-                            "-one\n"
-                            "+ONE\n"
-                            "*** Update File: app.py\n"
-                            "@@\n"
-                            "-ONE\n"
-                            "+one\n"
                             "*** End Patch\n"
                         )
                     }
@@ -314,6 +307,51 @@ class BreakerInRuntimeTests(unittest.TestCase):
         self.assertFalse(source_exists_after_move)
         self.assertFalse(read["isError"], read)
         self.assertEqual(read["structuredContent"]["content"], "anchor\nnew\n")
+
+    def test_move_source_deletion_resets_failures_even_when_destination_returns_to_baseline(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            (workspace / "a.txt").write_text("A\n", encoding="utf-8")
+            (workspace / "b.txt").write_text("B\n", encoding="utf-8")
+            runtime = Runtime(workspace, permission_mode="safe")
+            create_args = {
+                "changes": [{"action": "create", "path": "a.txt", "content": "NEW\n"}]
+            }
+            try:
+                first = runtime.call_tool("apply_changes", create_args)
+                second = runtime.call_tool("apply_changes", create_args)
+                moved = runtime.call_tool(
+                    "apply_patch",
+                    {
+                        "patch": (
+                            "*** Begin Patch\n"
+                            "*** Update File: a.txt\n"
+                            "*** Move to: b.txt\n"
+                            "@@\n"
+                            " A\n"
+                            "*** Update File: b.txt\n"
+                            "@@\n"
+                            "-A\n"
+                            "+B\n"
+                            "*** End Patch\n"
+                        )
+                    },
+                )
+                retried = runtime.call_tool("apply_changes", create_args)
+                recreated = (workspace / "a.txt").read_text(encoding="utf-8")
+            finally:
+                runtime.close()
+
+        self.assertEqual(first["structuredContent"]["error"]["code"], "PATCH_FAILED")
+        self.assertEqual(second["structuredContent"]["error"]["code"], "PATCH_FAILED")
+        self.assertFalse(moved["isError"], moved)
+        self.assertNotIn("_workspace_mutated", moved["structuredContent"])
+        self.assertIn(
+            {"path": "a.txt", "operation": "delete", "total_lines": 0},
+            moved["structuredContent"]["affected_files"],
+        )
+        self.assertFalse(retried["isError"], retried)
+        self.assertEqual(recreated, "NEW\n")
 
     def test_a_completed_exec_makes_workspace_read_verdicts_stale(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -469,6 +507,7 @@ class BreakerInRuntimeTests(unittest.TestCase):
                 workspace_mutation=WorkspaceMutationPolicy(mode="structured-only"),
             )
             try:
+                mutation = runtime.workspace_mutation_payload()
                 args = {"path": "late.txt"}
                 self.call(runtime, args)
                 self.call(runtime, args)
@@ -484,7 +523,10 @@ class BreakerInRuntimeTests(unittest.TestCase):
             finally:
                 runtime.close()
         self.assertEqual(command["structuredContent"]["operation_outcome"], "exited_0")
-        self.assertEqual(read["structuredContent"]["error"]["code"], "REPEATED_CALL_BLOCKED")
+        if mutation["enforced"]:
+            self.assertEqual(read["structuredContent"]["error"]["code"], "REPEATED_CALL_BLOCKED")
+        else:
+            self.assertEqual(read["structuredContent"]["error"]["code"], "NOT_FOUND")
 
     def test_unenforced_structured_only_mode_clears_stale_verdicts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

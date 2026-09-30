@@ -77,15 +77,25 @@ silently overwritten.
 `write` remains an upsert: it requires `revision` when its path exists and may
 omit it when creating a missing path. `create` rejects `revision` and asserts
 absence; `edit`, `delete`, `move`, and `copy` require it. A path may appear once
-per call; chaining several edits onto one file is `apply_patch`'s territory.
+per call; put several line edits for one file in that file's single `edit`
+change. Replacement content may use LF, CRLF, or CR separators; they are
+normalized before the file's existing line-ending convention is restored.
 See the contract for the full semantics, including the line-content rules
 (`""` is zero lines; a trailing newline adds a blank line) and the
 `insert_after` / `insert_before` boundaries.
 
 ### `apply_patch` recovery
 
-- `@@ <scope>` headers and `*** End of File` now participate in locating a
-  hunk instead of being ignored.
+- `@@ <context>` is a forward text anchor, not a language scope. The anchor
+  must be found at or after the current search cursor, and the hunk body is
+  matched only after it. This prevents fallback to an earlier identical block
+  without trying to infer Python indentation, JavaScript braces, or any other
+  language structure. A missing anchor is `PATCH_CONTEXT_NOT_FOUND`.
+- A pure-addition update hunk validates any `@@ <context>` first and then
+  appends at EOF, matching Codex's current placement semantics. Anchorless
+  pure additions also append at EOF.
+- `*** End of File` participates in locating non-empty old/context blocks
+  instead of being ignored.
 - Matching is graded: exact, then ignoring trailing whitespace, then ignoring
   indentation width. The grade actually used is reported in `match_quality`,
   so a downgrade is visible rather than silent.
@@ -99,19 +109,21 @@ See the contract for the full semantics, including the line-content rules
   trailing-whitespace match of a block that carries a context line, or a
   multi-line addition. A context-free single line found somewhere in the file
   is a coincidence and still fails. Evidence must also be non-blank, unique,
-  and inside the hunk's `@@` scope and EOF constraints.
+  and inside the same forward anchor/cursor window and EOF constraints.
 - `apply_patch` and `apply_changes` accept an optional `idempotency_key`. A
   replay of the same key with the same arguments returns the recorded result
   instead of doing the work twice; reusing the key for different arguments is
   `IDEMPOTENCY_KEY_REUSED`, and a `dry_run` result is never recorded.
   Concurrent duplicates under the same tool and key wait for the first call
   and replay its successful result.
-- Several `*** Update File` blocks naming one path in one envelope chain in
-  order. This already worked; it is now promised and tested. Their result has
-  one final per-path evidence record whose changed ranges describe the net
-  difference from the original baseline to the final staged bytes, not an
-  accumulation of intermediate block-local ranges. If that net result is the
-  original bytes, the baseline is verified without rewriting the file.
+- `apply_patch` now matches Codex path semantics: an operation's resolved
+  primary path may appear only once per envelope; `Add File` may replace an
+  existing file; `Move to` may replace an existing destination; and distinct
+  source files may move to one destination in order, with the later write
+  winning. Move destinations do not participate in the primary-path duplicate
+  check. Moves that change paths also report an explicit source `delete` in
+  `affected_files`, so machine-readable evidence describes the final workspace
+  rather than only the destination bytes.
 
 ### `git_diff` includes untracked files
 

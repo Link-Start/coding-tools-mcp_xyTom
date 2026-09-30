@@ -102,16 +102,25 @@ final newline is an ordinary line the hunk can add or remove.
 
 ### Locating a hunk
 
-A hunk has no line numbers; it finds itself by its context, so the context must
-be unique within the file. Two things narrow the search when it is not:
+A hunk has no line numbers; it finds itself by its context. Matching proceeds
+from a forward-only cursor, so later hunks cannot silently jump back to an
+earlier occurrence. Two locators affect placement:
 
-- `@@ <scope>` — the text after `@@` names the enclosing block (`@@ def
-  farewell`). Candidates are grouped by the scope anchor that most closely
-  precedes them; if one group remains, it wins. A unified-diff position header
+- `@@ <context>` — the text after `@@` is a language-agnostic text anchor, not
+  a parsed function/class/block scope. It must occur at or after the current
+  cursor; once found, old/context lines are searched only after that anchor.
+  Missing anchors fail with `PATCH_CONTEXT_NOT_FOUND`. This is intentionally
+  syntax-agnostic: Python indentation, braces, and other language constructs
+  do not define a search boundary. A unified-diff position header
   (`@@ -1,4 +1,4 @@`) names line numbers this dialect does not use and reads as
-  no scope.
+  no text anchor.
 - `*** End of File` — placed on its own line inside a hunk, it prefers the
   placement that reaches the end of the file.
+
+A hunk containing only added lines has no old/context block to locate. As in
+Codex, its `@@ <context>` anchor is still validated first, then the new lines
+are appended at EOF. Without an anchor, a pure-addition hunk simply appends at
+EOF.
 
 A blank context line may be written as `""` or as a single space; both mean the
 same empty line.
@@ -135,15 +144,26 @@ difference is preserved instead of being rewritten; added lines under the
 `indent` grade are re-indented by the block's uniform delta, and a delta that
 is not uniform disqualifies the grade rather than being approximated.
 
-### Chaining and idempotency
+### Primary paths, overwrites, and idempotency
 
-Several `*** Update File` blocks naming one path in one envelope chain in
-order: each sees the previous block's result. `apply_changes` is the
-declarative counterpart and rejects same-path duplicates instead. Chained
-blocks produce one final `affected_files` record for the resolved path; its
-revision and line count name the committed bytes, and its `changed_ranges`
-describe the net difference from the original baseline to those final bytes,
-not a stale accumulation of intermediate block-local ranges.
+`apply_patch` follows the Codex tool-entry path rules. Each operation's primary
+path may appear only once in an envelope after workspace resolution, so
+`a.txt` and `./a.txt` are the same primary path and a duplicate is rejected
+before any write. A `*** Move to:` destination is not a primary path: distinct
+source files may move to the same destination in order, and the later write
+wins. `*** Add File` may replace an existing file, and `*** Move to:` may
+replace an existing destination.
+
+A move destination can be a later operation's primary path, even before it
+exists on disk. Follow-up operations use its staged content and mode; an
+`Add File` overwrite preserves that mode. Every path retains its first
+baseline for the entire envelope, so repeated overwrites do not bypass
+conflict detection for intervening external changes.
+
+When a move changes paths, `affected_files` reports the destination's final
+state and an explicit `delete` record for the source path. This keeps the
+machine-readable evidence faithful even when a later operation makes the
+destination's final bytes equal to its original baseline.
 
 A hunk whose result is already in the file is skipped rather than failing, so
 replaying an envelope after a lost response returns success with
@@ -160,9 +180,10 @@ anchors the block where the hunk belonged — or a multi-line addition. A hunk
 with no context whose single added line is some common line (`pass`,
 `return None`) is not evidence of anything, and fails with
 `PATCH_CONTEXT_NOT_FOUND` and its repair data instead. The evidence must be
-unique inside the hunk's `@@` scope and `*** End of File` constraint. A result
-made only of blank lines is never evidence: every newline-terminated file has
-a trailing empty element in the patcher's line model.
+unique inside the same forward anchor/cursor window and `*** End of File`
+constraint. A result made only of blank lines is never evidence: every
+newline-terminated file has a trailing empty element in the patcher's line
+model.
 
 `idempotency_key` goes further: the runtime keeps one 64-entry
 least-recently-used cache across both write tools, keyed by `(tool, key)`, and

@@ -513,9 +513,18 @@ Supports `*** Add File`, `*** Update File`, `*** Delete File`, and
 
 Hunk location, grading, idempotency, and the success/failure fields are
 specified once in [tools-and-schemas.md](tools-and-schemas.md#apply_patch).
-Several `*** Update File` blocks naming one path in one envelope chain in
-order: the second sees the first's result. `apply_patch` carries no
-`revision` argument — its context lines are its optimistic check.
+An explicit `@@ <context>` is a forward-only text anchor. It must be found at
+or after the current hunk cursor, and the hunk body is searched only after the
+anchor. It does not create a language-aware function/class/block boundary.
+Pure-addition hunks validate their anchor, if any, and append at EOF.
+Each operation's resolved primary path may appear only once per envelope.
+`Add File` may overwrite an existing file and `Move to` may overwrite an
+existing destination. Move destinations are not primary paths, so distinct
+sources may move to one destination in order and the later write wins. A move
+that changes paths reports both the destination's final evidence and a source
+`delete` record in `affected_files`.
+`apply_patch` carries no `revision` argument — its context lines are its
+optimistic check.
 
 ### apply_changes
 
@@ -564,13 +573,16 @@ the file's `total_lines` in `details`.
 `content` is whole lines. `""` is **zero** lines, which is what makes `replace`
 with empty content a deletion; a trailing newline adds a blank line, so
 `"a\n"` is the two lines `a` and the empty line after it. There are no
-intra-line spans.
+intra-line spans. LF, CRLF, and CR separators supplied in replacement content
+are normalized before the target file's original line-ending convention is
+restored.
 
 A path may appear once per call, as `path` or as `destination`; a duplicate is
 `INVALID_ARGUMENT`. Paths are compared after they resolve, so `a.txt` and
-`./a.txt` are one path and naming both is the same error. Chaining several
-edits onto one file is `apply_patch`'s imperative territory. An empty `changes` array fails exactly as an empty patch
-does, with `PATCH_FAILED` and "No files were modified."
+`./a.txt` are one path and naming both is the same error. Put multiple line
+edits for one file in that file's single `edit` change. An empty `changes`
+array fails exactly as an empty patch does, with `PATCH_FAILED` and "No files
+were modified."
 
 The binding size limit is the 1 MiB HTTP request cap, not a change count. At
 most 100 changes and 200 edits per change are accepted as a guard against

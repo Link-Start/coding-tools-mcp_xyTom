@@ -660,7 +660,11 @@ class ToolSpec:
 def _count_lines(text: str) -> int:
     """Count file lines the way ``read_file`` reports ``total_lines``."""
 
-    return text.count("\n") + (1 if text and not text.endswith("\n") else 0)
+    # TextIO's universal-newline iteration treats CRLF, LF, and bare CR as
+    # line boundaries. Normalize only this temporary counting view; the
+    # caller's original bytes are preserved unchanged.
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    return normalized.count("\n") + (1 if normalized and not normalized.endswith("\n") else 0)
 
 
 def _patch_evidence(
@@ -695,10 +699,12 @@ def _merge_patch_affected_file(
 ) -> None:
     """Keep one final evidence record per resolved path.
 
-    Same-path update blocks chain through intermediate staged bytes, but only
-    the last bytes are ever committed. Merge placement quality here; once a
-    chain is complete, the caller replaces block-local ranges with a diff from
-    the original baseline to the final staged content.
+    A path staged as an earlier operation's destination can later become a
+    primary update path. Merge placement quality for that chained update; once
+    the chain is complete, the caller replaces block-local ranges with a diff
+    from the original baseline to the final staged content. Full destination
+    overwrites (Add and Move) replace evidence directly instead of using this
+    helper, because evidence from bytes they overwrite is stale.
     """
 
     path = str(entry["path"])
@@ -784,13 +790,17 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
     "apply_patch": ToolSpec(
         title="Apply patch",
         description=(
-            "Stage, validate, and atomically apply a V4A patch envelope. Each hunk locates itself by "
-            "its context, so the context must be unique in the file; when it is not, add a scope header "
-            "(@@ def my_function) naming the enclosing block, or add '*** End of File' to anchor the hunk "
-            "at the end. A blank context line may be written as \"\" or as a single space. Matching is "
+            "Stage, validate, and atomically apply a V4A patch envelope. Hunks are located from a "
+            "forward-only search cursor. `@@ <context>` is a language-agnostic text anchor that advances "
+            "that cursor; it does not name a function or block. A missing anchor fails rather than falling "
+            "back before it. A pure-addition hunk validates its anchor, if any, then appends at EOF. "
+            "`*** End of File` can disambiguate a non-empty hunk at the tail. A blank context line may be "
+            "written as \"\" or as a single space. Matching is "
             "graded exact, then ignoring trailing whitespace, then ignoring indentation width, and the "
             "grade actually used comes back as match_quality. Success returns each file's revision, "
-            "total_lines, and changed_ranges. Several updates to one path in one envelope chain in order. "
+            "total_lines, and changed_ranges. Each operation's primary path may appear only once per "
+            "envelope. Add File may replace an existing file; Move to may replace an existing destination, "
+            "and distinct source paths may move to the same destination in order (the later write wins). "
             "Full format reference: docs/tools-and-schemas.md. Example: "
             "*** Begin Patch\n*** Update File: app.py\n@@\n-old\n+new\n*** End Patch"
         ),
@@ -806,8 +816,8 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
             "copy always need that revision; create rejects it and asserts absence. edit takes line "
             "operations (replace, delete, insert_after, insert_before) whose numbers all refer to the "
             "file as read, not to the result of earlier edits in the same call. content is whole lines: "
-            "\"\" is zero lines and a trailing newline adds a blank line. One path per call; use "
-            "apply_patch to chain several edits onto one file. Example: {\"changes\":[{\"action\":\"edit\","
+            "\"\" is zero lines and a trailing newline adds a blank line. One path per call; combine "
+            "multiple line edits for one file into that file's single edit change. Example: {\"changes\":[{\"action\":\"edit\","
             "\"path\":\"app.py\",\"revision\":\"<from read_file>\",\"edits\":[{\"op\":\"replace\","
             "\"start_line\":10,\"end_line\":12,\"content\":\"new line\"}]}]}"
         ),
@@ -1990,6 +2000,7 @@ class Runtime:
             if blocked is not None:
                 raise self._repeat_failure_error(name, blocked)
             payload = handler(args)
+            workspace_mutated = payload.pop("_workspace_mutated", None)
             payload.setdefault("ok", True)
             if payload.get("ok") is False:
                 self._record_breaker_failure(name, fingerprint, payload, breaker_generation)
@@ -1997,7 +2008,7 @@ class Runtime:
                 content = spec.content_builder(payload) if spec.content_builder else None
                 return make_tool_result(name, payload, is_error=True, content=content)
             self.breaker.record_success(name, fingerprint, generation=breaker_generation)
-            if self._workspace_write_landed(name, payload):
+            if self._workspace_write_landed(name, payload, workspace_mutated=workspace_mutated):
                 # A write landed, so every "this call can never succeed"
                 # verdict the breaker holds was reached against a tree that no
                 # longer exists.
@@ -2225,13 +2236,20 @@ class Runtime:
             self._prune_idempotency_results_locked()
 
     @staticmethod
-    def _workspace_write_landed(name: str, payload: dict[str, Any]) -> bool:
+    def _workspace_write_landed(
+        name: str,
+        payload: dict[str, Any],
+        *,
+        workspace_mutated: Any = None,
+    ) -> bool:
         """Whether a structured write tool changed the workspace's net state."""
 
         if name not in WORKSPACE_WRITE_TOOLS or any(
             payload.get(flag) for flag in ("dry_run", "already_applied", "idempotent_replay")
         ):
             return False
+        if isinstance(workspace_mutated, bool):
+            return workspace_mutated
         affected = payload.get("affected_files")
         if not isinstance(affected, list):
             return False
@@ -2901,6 +2919,24 @@ class Runtime:
         dry_run = bool(args.get("dry_run", False))
         with self.patch_lock:
             operations = parse_patch(patch)
+            # Match the Codex tool-entry contract: an operation's primary
+            # path may appear only once in one envelope. Move destinations are
+            # deliberately not primary paths, so distinct sources may still
+            # move to the same destination and the later write wins.
+            primary_paths: dict[str, int] = {}
+            for operation_index, operation in enumerate(operations):
+                display = self._resolve_patch_path(operation.path, require_existing=False)
+                if display in primary_paths:
+                    raise ToolFailure(
+                        "PATCH_FAILED",
+                        f"Patch names the primary path {display} more than once.",
+                        category="validation",
+                        details={
+                            "path": display,
+                            "operation_indexes": [primary_paths[display], operation_index],
+                        },
+                    )
+                primary_paths[display] = operation_index
             staged: dict[str, StagedFile] = {}
             summaries: list[str] = []
             affected: dict[str, dict[str, Any]] = {}
@@ -2909,40 +2945,53 @@ class Runtime:
             additions = 0
             removals = 0
             for op in operations:
-                self._validate_patch_path(op.path, require_existing=op.kind in {"update", "delete"})
+                target = self.workspace.resolve_for_write(op.path)
+                prior = staged.get(target.display)
+                if op.kind in {"update", "delete"}:
+                    # A previous move can create this path only in staging.
+                    # Require an on-disk source only when it has no staged state.
+                    if prior is None:
+                        target = self.workspace.resolve_existing(op.path)
+                    elif prior.content is None:
+                        raise ToolFailure(
+                            "PATCH_FAILED", f"Cannot {op.kind} a deleted file.", category="validation"
+                        )
                 if op.kind in {"add", "update", "delete"}:
                     self.workspace.reject_write_symlink(op.path)
                 if op.move_to:
                     self._validate_patch_path(op.move_to, require_existing=False)
                     self.workspace.reject_write_symlink(op.move_to)
                 if op.kind == "add":
-                    target = self.workspace.resolve_for_write(op.path)
-                    if target.existed:
-                        raise ToolFailure("PATCH_FAILED", "Cannot add file that already exists.", category="validation")
-                    baseline = FileBaseline.capture(target.path)
+                    baseline = prior.baseline if prior is not None else FileBaseline.capture(target.path)
                     staged[target.display] = StagedFile(
                         target.display,
                         target.path,
                         op.add_content or "",
                         baseline,
-                        None,
+                        prior.mode if prior is not None else baseline.mode,
                     )
                     added_text = op.add_content or ""
-                    _merge_patch_affected_file(
-                        affected,
-                        {
-                            "path": target.display,
-                            "operation": "add",
-                            **_patch_evidence(added_text, _whole_file_range(added_text)),
-                        },
-                    )
+                    # Add is a full destination overwrite. Evidence must
+                    # describe the original destination bytes -> final bytes,
+                    # not retain ranges or match quality from an earlier move
+                    # that happened to stage the same destination first.
+                    affected[target.display] = {
+                        "path": target.display,
+                        "operation": "add",
+                        **_patch_evidence(
+                            added_text,
+                            changed_ranges_between(
+                                baseline.text(target.display), added_text
+                            ),
+                        ),
+                    }
                     summaries.append(f"A {target.display}")
                     additions += len(added_text.splitlines())
+                    if baseline.data is not None:
+                        removals += len(baseline.data.splitlines())
                 elif op.kind == "delete":
-                    target = self.workspace.resolve_existing(op.path)
                     if target.path.is_dir():
                         raise ToolFailure("PATCH_FAILED", "Cannot delete a directory.", category="validation")
-                    prior = staged.get(target.display)
                     baseline = prior.baseline if prior is not None else FileBaseline.capture(target.path)
                     staged[target.display] = StagedFile(
                         target.display, target.path, None, baseline, baseline.mode, action="delete"
@@ -2954,12 +3003,9 @@ class Runtime:
                     summaries.append(f"D {target.display}")
                     removals += len((baseline.data or b"").splitlines())
                 elif op.kind == "update":
-                    source = self.workspace.resolve_existing(op.path)
+                    source = target
                     if source.path.is_dir():
                         raise ToolFailure("PATCH_FAILED", "Cannot update a directory.", category="validation")
-                    prior = staged.get(source.display)
-                    if prior is not None and prior.content is None:
-                        raise ToolFailure("PATCH_FAILED", "Cannot update a deleted file.", category="validation")
                     baseline = prior.baseline if prior is not None else FileBaseline.capture(source.path)
                     content = prior.content if prior is not None else baseline.text(source.display)
                     assert content is not None
@@ -2977,13 +3023,25 @@ class Runtime:
                     source_mode = prior.mode if prior is not None else baseline.mode
                     if op.move_to:
                         dest = self.workspace.resolve_for_write(op.move_to)
-                        if dest.existed and dest.display != source.display:
-                            raise ToolFailure("PATCH_FAILED", "Cannot move over an existing file.", category="validation")
                         # Already-matching hunks make the content update a
                         # no-op, but relocating the file is still a write.
                         if operation_already_applied and dest.display == source.display:
                             already_applied_operations += 1
-                        dest_baseline = baseline if dest.display == source.display else FileBaseline.capture(dest.path)
+                        dest_prior = staged.get(dest.display)
+                        # Keep the first snapshot for the entire transaction;
+                        # recapturing a shared destination could accept and then
+                        # overwrite an intervening external edit.
+                        dest_baseline = (
+                            dest_prior.baseline if dest_prior is not None else
+                            baseline if dest.display == source.display else FileBaseline.capture(dest.path)
+                        )
+                        destination_evidence = _patch_evidence(
+                            updated,
+                            changed_ranges_between(
+                                dest_baseline.text(dest.display), updated
+                            ),
+                            quality=outcome.match_quality,
+                        )
                         staged[source.display] = StagedFile(
                             source.display,
                             source.path,
@@ -2998,40 +3056,41 @@ class Runtime:
                             dest_baseline,
                             source_mode,
                         )
-                        if prior is not None and dest.display != source.display:
-                            # Earlier blocks named the source, but only the
-                            # destination exists after this chain commits.
-                            previous_entry = affected.pop(source.display, None)
-                            if previous_entry is not None:
-                                affected[dest.display] = {
-                                    **previous_entry,
-                                    "path": dest.display,
-                                }
-                        _merge_patch_affected_file(
-                            affected,
-                            {
-                                "path": dest.display,
-                                "old_path": source.display,
-                                "operation": "move",
-                                **evidence,
-                            },
-                        )
-                        if prior is not None:
-                            affected[dest.display]["changed_ranges"] = changed_ranges_between(
-                                baseline.text(source.display), updated
-                            )
+                        if dest.display != source.display:
+                            # If this source was an earlier operation's
+                            # destination, its old evidence no longer describes
+                            # the final workspace state. Re-add it below as an
+                            # explicit deletion after recording the destination.
+                            affected.pop(source.display, None)
+                        # A move is a full destination overwrite. Replace any
+                        # evidence already recorded for the destination and
+                        # describe the original destination baseline -> final
+                        # staged bytes. This keeps revision/ranges/quality from
+                        # referring to different writes when destinations are
+                        # shared by several sources.
+                        affected[dest.display] = {
+                            "path": dest.display,
+                            "old_path": source.display,
+                            "operation": "move",
+                            **destination_evidence,
+                        }
+                        if dest.display != source.display:
+                            affected[source.display] = {
+                                "path": source.display,
+                                "operation": "delete",
+                                "total_lines": 0,
+                            }
                         summaries.append(f"R {source.display} -> {dest.display}")
                     else:
                         if operation_already_applied:
                             already_applied_operations += 1
-                        # The final staged bytes, rather than only this block's
-                        # input, decide whether a write is necessary. A chain
-                        # of already-applied blocks, or a later block that
-                        # returns an earlier edit to the original bytes, must
-                        # remain a baseline assertion and preserve the mtime.
+                        # The final staged state, rather than only this block's
+                        # input, decides whether a write is necessary. Content
+                        # that returns to the baseline can still require a
+                        # write when a prior move carried a different mode.
                         block_unchanged = updated == content
                         baseline_content = baseline.text(source.display)
-                        net_unchanged = updated == baseline_content
+                        net_unchanged = updated == baseline_content and source_mode == baseline.mode
                         staged[source.display] = StagedFile(
                             source.display,
                             source.path,
@@ -3057,6 +3116,7 @@ class Runtime:
                         summaries.append(f"{'=' if block_unchanged else 'M'} {source.display}")
             if not affected:
                 raise ToolFailure("PATCH_FAILED", "No files were modified.", category="validation")
+            workspace_mutated = any(change.action != "verify" for change in staged.values())
             if not dry_run:
                 self._commit_staged_files(list(staged.values()))
         return {
@@ -3072,6 +3132,7 @@ class Runtime:
             "additions": additions,
             "removals": removals,
             "warnings": warnings,
+            "_workspace_mutated": workspace_mutated and not dry_run,
         }
 
     def apply_changes(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -3110,6 +3171,7 @@ class Runtime:
                 unchanged_files += entry["operation"] == "unchanged"
             if not affected:
                 raise ToolFailure("PATCH_FAILED", "No files were modified.", category="validation")
+            workspace_mutated = any(change.action != "verify" for change in staged.values())
             if not dry_run:
                 self._commit_staged_files(list(staged.values()))
         return {
@@ -3122,6 +3184,7 @@ class Runtime:
             "additions": additions,
             "removals": removals,
             "warnings": warnings,
+            "_workspace_mutated": workspace_mutated and not dry_run,
         }
 
     def _resolve_change_paths(self, change: ChangeRequest) -> list[tuple[int, str]]:
@@ -3170,11 +3233,13 @@ class Runtime:
             action="verify" if unchanged else "write",
         )
         operation = "unchanged" if unchanged else ("create" if current is None else "write")
-        ranges: list[dict[str, int]] = [] if unchanged else _whole_file_range(content)
+        ranges: list[dict[str, int]] = (
+            [] if unchanged else changed_ranges_between(current or "", content)
+        )
         entry = {"path": target.display, "operation": operation, **_patch_evidence(content, ranges)}
         marker = {"unchanged": "=", "create": "A"}.get(operation, "M")
         return entry, f"{marker} {target.display}", 0 if unchanged else _count_lines(content), (
-            0 if current is None else _count_lines(current)
+            0 if unchanged or current is None else _count_lines(current)
         )
 
     def _stage_edited_file(

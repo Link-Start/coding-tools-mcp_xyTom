@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.5.0 - 2026-09-14
 
 The v0.5.0 reliability work. Migration notes:
 [docs/migration-0.5.md](docs/migration-0.5.md); rationale:
@@ -78,17 +78,16 @@ The v0.5.0 reliability work. Migration notes:
 
 ### Changed
 
-- **`apply_patch` locates hunks with more than context.** `@@ <scope>` headers
-  and `*** End of File` now participate in placing a hunk instead of being
-  ignored.
+- **`apply_patch` locates hunks with forward text anchors.** `@@ <context>`
+  advances a language-agnostic search cursor; it does not infer function or
+  block boundaries. `*** End of File` also participates in placement.
 - **Patch matching is graded** — exact, then ignoring trailing whitespace, then
   ignoring indentation width — and the grade actually used is reported in
   `match_quality`, so a downgrade is visible rather than silent.
 - **A successful patch returns evidence**: `changed_ranges`, a per-file
   `revision`, and `total_lines`. These are evidence only; `apply_patch` still
   takes no `revision` argument, because its context lines are already its
-  optimistic check. For chained blocks, ranges describe the net original
-  baseline-to-final result rather than accumulated intermediate ranges.
+  optimistic check.
 - **A failed patch returns repair data**: the hunk index, nearby numbered text,
   and candidate match positions, so the next attempt can be aimed.
 - **A patch whose changes are already present reports `already_applied`**
@@ -99,10 +98,12 @@ The v0.5.0 reliability work. Migration notes:
   fails with `PATCH_CONTEXT_NOT_FOUND`. A `*** Move to:` that actually
   relocates the file remains a write and reports `already_applied: false` even
   when every hunk was already present.
-- **Same-path chaining in `apply_patch` is now promised.** Several
-  `*** Update File` blocks naming one path in one envelope chain in order. This
-  already worked and is now documented, unit-tested, and covered by
-  `make test-patch-repro` in CI.
+- **`apply_patch` now follows Codex primary-path and overwrite semantics.** An
+  operation's primary path may appear only once in an envelope, including
+  aliases such as `a.txt` and `./a.txt`. `Add File` may replace an existing
+  file, `Move to` may replace an existing destination, and distinct source
+  files may move to the same destination in order, with the later write
+  winning.
 - **`apply_changes` compares paths after resolving them**, so `a.txt` and
   `./a.txt` are one path: naming both is `INVALID_ARGUMENT` rather than a
   silent overwrite reported as two applied changes.
@@ -125,6 +126,50 @@ The v0.5.0 reliability work. Migration notes:
 - The runtime contract now states that `patch_lock` serializes patches within
   one server process only; two servers on one workspace are protected by the
   pre-commit baseline recheck alone.
+
+### Fixed
+
+- **Chained patch operations retain staged file state.** A newly moved
+  destination can be updated, deleted, or moved again in the same envelope,
+  and a later `Add File` overwrite preserves its staged executable mode.
+  Repeated destination writes keep the first baseline, so an intervening
+  external edit raises `PATCH_CONFLICT` instead of being overwritten.
+- **`apply_changes` no longer doubles carriage returns in CRLF replacement
+  content.** Replacement text now normalizes LF, CRLF, and CR separators before
+  the file's original line-ending convention is restored, so returned
+  `total_lines` and `changed_ranges` stay consistent with a subsequent
+  `read_file`.
+- **`@@ <context>` now follows Codex-style forward-cursor semantics.** Missing
+  anchors fail instead of being ignored, matching never jumps back before the
+  anchor/current cursor, top-level and brace-based code are not rejected by
+  indentation heuristics, and pure-addition hunks validate their anchor before
+  appending at EOF.
+- **Move evidence and breaker invalidation now follow actual staged
+  mutations.** Moves that change paths retain an explicit source deletion in
+  `affected_files`, and successful workspace-mutation invalidation is derived
+  from committed staged actions rather than compressed display evidence.
+- **Move mode preservation now survives later content reversion.** A staged
+  file is considered unchanged only when both its content and mode match the
+  original destination baseline, so an executable source moved over a
+  non-executable destination keeps its executable bit even if later patch
+  operations restore the destination's original bytes.
+- **Whole-file `apply_changes` evidence now reports line counts consistently.**
+  Rewriting identical content reports zero additions/removals, and replacement
+  ranges count removed lines from the original file. Bare-CR content is also
+  counted with the same universal-newline rules as `read_file` without
+  rewriting the user's bytes.
+- The long-running PTY compliance test now polls the bounded terminal stream
+  for final child output instead of assuming input echo and process output
+  arrive in one response.
+- Cloudflare local `.dev.vars*` and `.env*` files remain ignored after the
+  control-plane move to `infra/cloudflare/`.
+- Release-gate tests now distinguish unavailable Landlock/PTY host capabilities
+  from product behavior and no longer race the 16-command concurrency limit
+  while testing completed-command retention.
+- Regenerated `uv.lock` from the v0.5.0 release metadata, including the current
+  `mcp` and `PyYAML` development dependencies. The release checker now rejects
+  a checked-in uv lock whose project version or dev dependency set has drifted
+  from `pyproject.toml`.
 
 ### Other
 

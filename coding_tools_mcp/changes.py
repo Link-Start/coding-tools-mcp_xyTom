@@ -264,7 +264,7 @@ def reject_duplicate_paths(targets: Sequence[tuple[int, str]]) -> None:
 
     apply_changes is declarative: two entries naming one path describe two
     states for it, and the line numbers in the second were read before the
-    first existed. apply_patch is the tool that chains edits to one file.
+    first existed. Combine edits for one file into one change.
 
     Each entry pairs the index of the change with the *resolved* display path
     it names, because that is the key the staging map uses. Comparing the raw
@@ -278,7 +278,7 @@ def reject_duplicate_paths(targets: Sequence[tuple[int, str]]) -> None:
             raise ToolFailure(
                 "INVALID_ARGUMENT",
                 f"changes[{index}] names {path}, which changes[{seen[path]}] already names. "
-                "Combine them into one change, or use apply_patch to chain edits to one file.",
+                "Combine them into one change.",
                 category="validation",
                 details={"path": path, "change_indexes": [seen[path], index]},
             )
@@ -290,11 +290,14 @@ def content_lines(content: str) -> list[str]:
 
     ``""`` is zero lines, which is what makes ``replace`` with empty content a
     deletion. Python would otherwise report ``"".split("\\n") == [""]`` — one
-    empty line — and every emptied range would keep a stray blank line. A
+    empty line — and every emptied range would keep a stray blank line. The
+    request may contain LF, CRLF, or CR separators; normalize them before the
+    split so a CRLF request applied to a CRLF file does not retain ``\\r`` and
+    then receive a second ``\\r`` when the file's line ending is restored. A
     trailing newline does add a blank line: ``"a\\n"`` is ``["a", ""]``.
     """
 
-    return content.split("\n") if content else []
+    return normalize_to_lf(content).split("\n") if content else []
 
 
 def split_lines(text: str) -> tuple[list[str], bool]:
@@ -383,7 +386,6 @@ def _placement(edit: LineEdit, lines: list[str], total_lines: int, path: str) ->
         end=edit.end,
         new=list(edit.lines),
         quality="exact",
-        scope_used=False,
         old=lines[edit.start : edit.end],
     )
 
