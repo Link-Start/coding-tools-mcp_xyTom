@@ -66,6 +66,11 @@ jobs:
   swebench-lite:
     name: Evidence
     uses: ./.github/workflows/swebench-lite.yml
+    with:
+      # SWE-bench is useful release evidence, but the official harness depends
+      # on mutable external infrastructure. Keep collecting its artifacts
+      # without allowing harness/environment drift to block a package release.
+      blocking: false
 
   build:
     name: Build distribution
