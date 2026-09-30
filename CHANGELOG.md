@@ -29,6 +29,11 @@ The v0.5.0 reliability work. Migration notes:
 
 ### Added
 
+- **Opt-in local tool event journal.** `CODING_TOOLS_MCP_EVENT_LOG_DIR` retains
+  metadata-only call start/end records in a bounded private JSONL ring across
+  restarts. HTTP and stdio share the same coverage; existing TRACE and telemetry
+  are unchanged. See [operator guidance](docs/troubleshooting.md#durable-local-tool-events)
+  for failure handling, privacy, and task-handoff limits.
 - **`apply_changes`**, a line-addressed editing tool. Each change names an
   action (`create`, `write`, `edit`, `delete`, `move`, `copy`) and a path.
   Existing targets use the `revision` `read_file` reported. `write` is an

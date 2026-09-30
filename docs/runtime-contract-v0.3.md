@@ -203,7 +203,9 @@ mirror its body is still refused with `400` and `-32020`.
   command outlives its request and is shared by every client of the workspace;
   terminate one with `kill_command`.
 - stdio is newline-delimited JSON-RPC. stdout contains protocol messages only;
-  diagnostics and logs go to stderr.
+  diagnostics and logs go to stderr. An explicit operator setting can also
+  retain [local tool events](troubleshooting.md#durable-local-tool-events) on
+  disk; this does not advertise the MCP logging capability.
 - The server card at `/.well-known/mcp.json` and
   `/.well-known/mcp/server-card.json` reports `supportedProtocolVersions`,
   every version this server speaks, newest first.
