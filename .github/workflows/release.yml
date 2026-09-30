@@ -33,6 +33,13 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Require a release tag ref
+        run: |
+          if [[ "$GITHUB_REF" != refs/tags/v* ]]; then
+            echo "release must run from a v* tag ref, got $GITHUB_REF" >&2
+            exit 1
+          fi
+
       - name: Validate release metadata
         run: python scripts/check_release_versions.py --tag "$GITHUB_REF_NAME"
 
@@ -148,8 +155,51 @@ jobs:
           name: python-package-distributions
           path: dist/
 
+      - name: Report distributions already published with different contents
+        run: |
+          python - <<'PY'
+          import glob
+          import hashlib
+          import json
+          import os
+          import urllib.error
+          import urllib.request
+
+          version = os.environ["GITHUB_REF_NAME"].removeprefix("v")
+          try:
+              with urllib.request.urlopen(
+                  f"https://pypi.org/pypi/coding-tools-mcp/{version}/json"
+              ) as response:
+                  published = {
+                      item["filename"]: item["digests"]["sha256"]
+                      for item in json.load(response)["urls"]
+                  }
+          except urllib.error.HTTPError as error:
+              if error.code != 404:
+                  raise
+              published = {}
+          for path in sorted(glob.glob("dist/*")):
+              name = os.path.basename(path)
+              if name not in published:
+                  continue
+              with open(path, "rb") as handle:
+                  digest = hashlib.sha256(handle.read()).hexdigest()
+              if digest == published[name]:
+                  print(f"{name}: already published, identical")
+              else:
+                  print(
+                      f"::warning::{name} is already on PyPI with different "
+                      "bytes (rebuilds are not byte-reproducible); "
+                      "skipping its upload"
+                  )
+          PY
+
       - name: Publish package distributions to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          # Recovery re-dispatches must be able to resume after PyPI already
+          # accepted the (immutable) files from an earlier run.
+          skip-existing: true
 
   pack-npm:
     name: Pack npm launcher
