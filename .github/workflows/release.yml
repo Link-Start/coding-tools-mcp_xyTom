@@ -1,10 +1,10 @@
 name: release
 
-# One action releases: push a v<version> tag and everything below runs from
-# that single commit — evidence workflows, package builds, registry publishes,
-# and the GitHub Release. Evidence and publishes are jobs of this one run, so
-# the "same release commit" audit property holds by construction; no run ids,
-# no inputs, no branch/tag dispatch choices.
+# A release normally starts by pushing a v<version> tag. workflow_dispatch is
+# also available as a recovery/manual path: dispatch this workflow with the
+# release tag as the selected ref. In either case everything below runs from
+# that single tagged commit — evidence workflows, package builds, registry
+# publishes, and the GitHub Release.
 #
 # PyPI and npm trusted publishing must be configured with this workflow's
 # filename (release.yml) and the pypi / npm environments.
@@ -12,6 +12,7 @@ name: release
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
 
 permissions:
   contents: read
